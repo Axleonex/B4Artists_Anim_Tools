@@ -1,0 +1,1313 @@
+"""
+mesh_ghosts.py — Full mesh onion skinning for Ghost Tool.
+
+Creates semi-transparent duplicate meshes at ghost frame positions,
+giving animators an onion-skin style preview of how the
+character mesh looks at in-between frames.
+
+Lifecycle:
+    1. generate_mesh_ghosts() — called after point ghosts are generated.
+       For each unique frame in the ghost set it:
+         a. Moves the scene to that frame
+         b. Evaluates the depsgraph to get the deformed mesh
+         c. Creates a lightweight mesh duplicate with a transparent material
+         d. Parents it to a collector empty named "GhostMeshes"
+    2. clear_mesh_ghosts()  — removes all duplicates and the collector.
+    3. update_mesh_ghost_visibility() — shows / hides based on settings.
+
+Materials:
+    Two colour ramps: PAST frames tint blue, FUTURE frames tint orange.
+    The alpha fades out the further the ghost is from the current frame.
+    Flat shading, no shadows, so the silhouettes read clearly against
+    the viewport even in solid / material preview mode.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+import bpy
+from mathutils import Vector
+
+from .utils import log, warn, debug, tag_viewport_redraw
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+GHOST_MESH_COLLECTION = "GhostTool_MeshGhosts"
+"""Name of the collection that holds all mesh ghost objects."""
+
+GHOST_MESH_PREFIX = "GhostMesh_"
+"""Prefix for mesh ghost object names (e.g. GhostMesh_f24.0)."""
+
+# Custom property keys used to mark and identify ghost mesh objects
+GHOST_TOOL_MESH_GHOST_KEY = "ghost_tool_mesh_ghost"  # Boolean: marks an object as a ghost mesh
+GHOST_TOOL_FRAME_KEY = "ghost_tool_frame"            # Float: the frame at which this ghost was evaluated
+GHOST_TOOL_IS_PAST_KEY = "ghost_tool_is_past"        # Boolean: whether the ghost is in the past
+GHOST_TOOL_BASE_ALPHA_KEY = "ghost_tool_base_alpha"  # Float: base transparency (before opacity_scale)
+
+PAST_COLOR = (0.25, 0.55, 1.0)       # Cool blue
+FUTURE_COLOR = (1.0, 0.55, 0.15)     # Warm orange
+CURRENT_COLOR = (0.2, 1.0, 0.4)      # Bright green (for the current frame)
+
+MAX_MESH_GHOSTS = 32
+"""Safety cap to avoid memory explosions on dense timelines."""
+
+MIN_ALPHA = 0.05
+MAX_ALPHA = 0.40
+"""Transparency range — closest ghosts are MAX_ALPHA, farthest are MIN_ALPHA."""
+
+WIREFRAME_ALPHA = 0.6
+"""Alpha for wireframe overlay variant."""
+
+COORDS_PER_VERTEX = 3
+"""Number of coordinates (x, y, z) per vertex position."""
+
+
+# ---------------------------------------------------------------------------
+# Material factory
+# ---------------------------------------------------------------------------
+
+def _get_or_create_ghost_material(
+    name: str,
+    color: tuple[float, float, float],
+    alpha: float,
+    wireframe: bool = False,
+) -> bpy.types.Material:
+    """Get an existing ghost material or create a new one.
+
+    Uses Blender's node-based materials with a Principled BSDF set to
+    transparent.  The material renders in both Solid and Material Preview
+    modes.
+
+    Args:
+        name:  Unique material name.
+        color: RGB base colour (0-1 per channel).
+        alpha: Transparency value (0 = invisible, 1 = opaque).
+        wireframe: If True, use wireframe display instead of solid.
+
+    Returns:
+        The Blender Material object.
+    """
+    mat = bpy.data.materials.get(name)
+    if mat is not None:
+        # Material already exists — update its color and alpha in case settings changed
+        mat.diffuse_color = (*color, alpha)
+        if mat.use_nodes and mat.node_tree:
+            # Update the Principled BSDF shader node
+            for node in mat.node_tree.nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    node.inputs['Base Color'].default_value = (*color, 1.0)
+                    node.inputs['Alpha'].default_value = alpha
+                    break
+        return mat
+
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+
+    # Eevee transparency — attribute names vary by Blender version
+    # Blender < 4.0: blend_method / shadow_method
+    # Blender 4.x+: may use surface_render_method or just node-based alpha
+    for attr, val in [('blend_method', 'BLEND'), ('shadow_method', 'NONE')]:
+        if hasattr(mat, attr):
+            try:
+                setattr(mat, attr, val)
+            except (AttributeError, TypeError) as exc:
+                debug(f"Could not configure ghost material node: {exc}")
+
+    mat.use_backface_culling = False
+    mat.diffuse_color = (*color, alpha)
+
+    # Configure the Principled BSDF for flat transparent shading
+    tree = mat.node_tree
+    tree.nodes.clear()
+
+    output = tree.nodes.new('ShaderNodeOutputMaterial')
+    output.location = (300, 0)
+
+    bsdf = tree.nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (0, 0)
+    bsdf.inputs['Base Color'].default_value = (*color, 1.0)
+    bsdf.inputs['Alpha'].default_value = alpha
+    # Flat look — minimal specular / roughness adjustments
+    bsdf.inputs['Roughness'].default_value = 1.0
+    _set_shader_input(bsdf, ['Specular IOR Level', 'Specular'], 0.0)
+
+    tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+
+    return mat
+
+
+def _set_shader_input(bsdf_node, input_names: list[str], value) -> bool:
+    """Try setting a BSDF input by name, trying each name in order.
+
+    Handles version-dependent BSDF input names (e.g., "Specular IOR Level"
+    vs "Specular" in older Blender versions).
+
+    Args:
+        bsdf_node: The Principled BSDF shader node.
+        input_names: List of input names to try, in priority order.
+        value: The value to set on the first matching input.
+
+    Returns:
+        bool: True if an input was successfully set, False if no matching input found.
+    """
+    for name in input_names:
+        try:
+            bsdf_node.inputs[name].default_value = value
+            return True
+        except (KeyError, IndexError):
+            continue
+    return False
+
+
+def _apply_mesh_falloff(normalized_distance: float, curve_type: str) -> float:
+    """Apply a falloff curve to a normalised distance for mesh ghosts.
+
+    Mirrors the viewport_draw falloff but avoids a cross-module import.
+
+    Args:
+        normalized_distance: Normalised distance (0 = at cursor, 1 = farthest).
+        curve_type: Falloff curve type - one of "LINEAR", "SMOOTH", "EXPONENTIAL", "CONSTANT".
+
+    Returns:
+        float: Adjusted distance factor (0–1).
+    """
+    normalized_distance = max(0.0, min(normalized_distance, 1.0))
+    if curve_type == "CONSTANT":
+        return 0.0
+    elif curve_type == "SMOOTH":
+        return normalized_distance * normalized_distance * (3.0 - 2.0 * normalized_distance)
+    elif curve_type == "EXPONENTIAL":
+        return 1.0 - pow(1.0 - normalized_distance, 3.0)
+    return normalized_distance  # LINEAR
+
+
+def _compute_ghost_color_alpha(
+    ghost_frame: float,
+    current_frame: float,
+    frame_range_width: float,
+    settings=None,
+) -> tuple[tuple[float, float, float], float]:
+    """Compute the colour and alpha for a mesh ghost based on its time distance.
+
+    Past frames are blue, future frames are orange.  Alpha fades with distance.
+    When *settings* is provided, uses user-configurable colors, min alpha,
+    and falloff curve from the scene's GhostToolSceneSettings.
+
+    Args:
+        ghost_frame:      Frame number of the ghost.
+        current_frame:    The scene's current frame.
+        frame_range_width: Total frame span being ghosted (for normalizing).
+        settings:         Optional GhostToolSceneSettings for user overrides.
+
+    Returns:
+        Tuple of (r, g, b) colour and alpha float.
+    """
+    frame_offset = ghost_frame - current_frame
+    if frame_range_width <= 0:
+        frame_range_width = 1.0
+
+    # Normalised distance from current frame (0 = at current, 1 = farthest)
+    raw_normalized_distance = min(abs(frame_offset) / frame_range_width, 1.0)
+
+    # Apply falloff curve
+    falloff_curve = settings.ghost_falloff_curve if settings else 'LINEAR'
+    falloff_adjusted_distance = _apply_mesh_falloff(raw_normalized_distance, falloff_curve)
+
+    # Colour: mesh-specific overrides take priority, fall back to point ghost colors
+    if settings:
+        past_rgb = tuple(settings.mesh_ghost_past_color)
+        future_rgb = tuple(settings.mesh_ghost_future_color)
+    else:
+        past_rgb = PAST_COLOR
+        future_rgb = FUTURE_COLOR
+
+    color = past_rgb if frame_offset < 0 else future_rgb
+
+    # Min alpha from settings
+    user_min_alpha = settings.ghost_min_alpha if settings else MIN_ALPHA
+    effective_min_alpha = max(MIN_ALPHA, user_min_alpha)
+
+    # Alpha: lerp from MAX_ALPHA at distance=0 to effective_min_alpha at distance=1
+    alpha = MAX_ALPHA + (effective_min_alpha - MAX_ALPHA) * falloff_adjusted_distance
+
+    return color, alpha
+
+
+# ---------------------------------------------------------------------------
+# Collection management
+# ---------------------------------------------------------------------------
+
+def _get_or_create_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    """Get or create the GhostTool mesh ghost collection.
+
+    The collection is linked to the scene's master collection and has
+    viewport display set to wireframe or bounds for performance.
+
+    Args:
+        scene: The Blender scene.
+
+    Returns:
+        The mesh ghost collection.
+    """
+    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    if coll is None:
+        coll = bpy.data.collections.new(GHOST_MESH_COLLECTION)
+        scene.collection.children.link(coll)
+    elif coll.name not in scene.collection.children:
+        scene.collection.children.link(coll)
+
+    # Mark collection as non-selectable / non-renderable by default
+    # (user can override in the outliner if needed)
+    try:
+        layer_coll = _find_layer_collection(
+            bpy.context.view_layer.layer_collection, GHOST_MESH_COLLECTION
+        )
+        if layer_coll:
+            layer_coll.exclude = False
+    except Exception as exc:
+        warn(f"Could not configure ghost collection layer: {exc}")
+
+    return coll
+
+
+def _find_layer_collection(root: bpy.types.LayerCollection, name: str) -> Optional[bpy.types.LayerCollection]:
+    """Recursively find a LayerCollection by name.
+
+    Args:
+        root: The root LayerCollection to search.
+        name: Collection name to find.
+
+    Returns:
+        LayerCollection matching the given name, or None if not found.
+    """
+    if root.name == name:
+        return root
+    for child in root.children:
+        found = _find_layer_collection(child, name)
+        if found:
+            return found
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Core mesh ghost generation
+# ---------------------------------------------------------------------------
+
+def _compute_desired_mesh_frames(
+    ghost_frames: list[float],
+    current_frame: float,
+    past_count: int,
+    future_count: int,
+    step: int,
+) -> list[float]:
+    """Compute the final list of frames to generate mesh ghosts at.
+
+    Filters the input frames into past/future groups, applies step filtering,
+    respects past/future count limits, and enforces the global MAX_MESH_GHOSTS
+    cap by keeping the closest ghosts from each side.
+
+    Args:
+        ghost_frames: Raw list of frame numbers.
+        current_frame: The scene's current frame.
+        past_count: Maximum number of past-frame ghosts.
+        future_count: Maximum number of future-frame ghosts.
+        step: Frame step filter (1 = every frame, 2 = every other frame, etc.).
+
+    Returns:
+        list[float]: Sorted list of frames to generate ghosts at.
+    """
+    # Separate past and future frames
+    past_frames = sorted(
+        [f for f in ghost_frames if f < current_frame],
+        reverse=True,  # closest first
+    )
+    future_frames = sorted(
+        [f for f in ghost_frames if f > current_frame],
+    )
+
+    # Apply step filter
+    if step > 1:
+        past_frames = past_frames[::step]
+        future_frames = future_frames[::step]
+
+    # Apply count limits
+    past_frames = past_frames[:past_count]
+    future_frames = future_frames[:future_count]
+
+    # Combined, but also enforce global cap
+    all_frames = sorted(set(past_frames + future_frames))
+    if len(all_frames) > MAX_MESH_GHOSTS:
+        # Keep closest ghosts from each side
+        half = MAX_MESH_GHOSTS // 2
+        all_frames = sorted(set(past_frames[:half] + future_frames[:half]))
+
+    return all_frames
+
+
+def _evaluate_and_create_ghost_mesh(
+    context: bpy.types.Context,
+    mesh_obj: bpy.types.Object,
+    frame: float,
+    current_frame: float,
+    coll: bpy.types.Collection,
+    use_wire: bool,
+    frame_range_width: float,
+    scene_settings,
+) -> Optional[bpy.types.Object]:
+    """Evaluate the mesh at a specific frame and create a ghost duplicate.
+
+    Temporarily moves the scene to the frame, evaluates the deformed mesh
+    geometry, creates a new static mesh object with appropriate transparency
+    and material, and sets up custom properties. Returns the created ghost
+    object or None if evaluation failed.
+
+    Args:
+        context: Current Blender context.
+        mesh_obj: The source mesh object to evaluate.
+        frame: Frame number to evaluate at.
+        current_frame: Scene's current frame (for color/alpha calculation).
+        coll: Collection to link the ghost object into.
+        use_wire: Whether to use wireframe display mode.
+        frame_range_width: Total frame span for alpha falloff calculation.
+        scene_settings: GhostToolSceneSettings or None.
+
+    Returns:
+        bpy.types.Object: The created ghost object, or None if creation failed.
+    """
+    scene = context.scene
+
+    # Move to frame and evaluate
+    scene.frame_set(int(round(frame)))
+    depsgraph = context.evaluated_depsgraph_get()
+
+    # Get the evaluated (deformed) mesh
+    eval_obj = mesh_obj.evaluated_get(depsgraph)
+    if eval_obj is None:
+        return None
+
+    try:
+        eval_mesh = eval_obj.to_mesh()
+    except RuntimeError as exc:
+        warn(f"Could not evaluate mesh at frame {frame}: {exc}")
+        return None
+
+    if eval_mesh is None:
+        return None
+
+    # Create a new mesh data block from the evaluated mesh
+    ghost_mesh = bpy.data.meshes.new(f"{GHOST_MESH_PREFIX}data_{frame:.0f}")
+    ghost_mesh.from_pydata(
+        [v.co.copy() for v in eval_mesh.vertices],
+        [],
+        [list(p.vertices) for p in eval_mesh.polygons],
+    )
+    ghost_mesh.update()
+
+    # Copy normals for better shading
+    if hasattr(eval_mesh, 'calc_normals'):
+        ghost_mesh.calc_normals()
+
+    # Also copy loop normals for smooth shading
+    try:
+        ghost_mesh.normals_split_custom_set_from_vertices(
+            [v.normal.copy() for v in eval_mesh.vertices]
+        )
+    except Exception as exc:
+        warn(f"Could not set custom normals at frame {frame}: {exc}")
+
+    # Clean up the evaluated mesh
+    eval_obj.to_mesh_clear()
+
+    # Create the ghost object
+    ghost_name = f"{GHOST_MESH_PREFIX}f{frame:.0f}"
+    ghost_obj = bpy.data.objects.new(ghost_name, ghost_mesh)
+
+    # Custom properties to identify and track this ghost mesh
+    # Set early, right after object creation
+    ghost_obj[GHOST_TOOL_MESH_GHOST_KEY] = True
+    ghost_obj[GHOST_TOOL_FRAME_KEY] = frame
+    ghost_obj[GHOST_TOOL_IS_PAST_KEY] = (frame < current_frame)
+
+    # Position: copy world matrix from the evaluated source
+    ghost_obj.matrix_world = mesh_obj.matrix_world.copy()
+
+    # Material — pass scene settings for user-configurable colors/falloff
+    color, alpha = _compute_ghost_color_alpha(
+        frame, current_frame, frame_range_width, settings=scene_settings,
+    )
+    mat_name = f"GhostMat_{frame:.0f}"
+
+    if use_wire:
+        # Use the computed falloff alpha instead of the fixed WIREFRAME_ALPHA,
+        # but cap it so wireframes remain slightly transparent (visual hint).
+        wire_alpha = min(alpha, WIREFRAME_ALPHA)
+        mat = _get_or_create_ghost_material(mat_name, color, wire_alpha, wireframe=True)
+    else:
+        mat = _get_or_create_ghost_material(mat_name, color, alpha)
+
+    ghost_obj.data.materials.append(mat)
+
+    # Display settings
+    if use_wire:
+        ghost_obj.display_type = 'WIRE'
+    else:
+        ghost_obj.display_type = 'SOLID'
+
+    # Make non-selectable and non-renderable
+    ghost_obj.hide_select = True
+    ghost_obj.hide_render = True
+
+    # Enable smooth shading for solid mode
+    if not use_wire:
+        for poly in ghost_obj.data.polygons:
+            poly.use_smooth = True
+
+    # Apply outline via Solidify modifier if enabled
+    if scene_settings and scene_settings.ghost_outline_enabled:
+        _apply_outline_modifier(ghost_obj, scene_settings, frame, current_frame)
+
+    # Link to the ghost collection
+    coll.objects.link(ghost_obj)
+
+    return ghost_obj
+
+
+def generate_mesh_ghosts(
+    context: bpy.types.Context,
+    source_obj: bpy.types.Object,
+    ghost_frames: list[float],
+    mode: str = "SOLID",
+    past_count: int = 5,
+    future_count: int = 5,
+    step: int = 1,
+) -> int:
+    """Generate mesh ghost duplicates at specified frames.
+
+    For each frame, the scene is temporarily moved to that frame,
+    the depsgraph is evaluated, and a snapshot of the deformed mesh
+    is created as a static mesh object with a transparent material.
+
+    Args:
+        context:      Current Blender context.
+        source_obj:   The mesh object (or armature's child mesh) to duplicate.
+        ghost_frames: List of frame numbers to create ghosts at.
+        mode:         Display mode — "SOLID" for shaded, "WIRE" for wireframe.
+        past_count:   Max number of past-frame ghosts.
+        future_count: Max number of future-frame ghosts.
+        step:         Frame step between ghosts (1 = every frame).
+
+    Returns:
+        int: Number of mesh ghosts created.
+    """
+    scene = context.scene
+    current_frame = scene.frame_current
+    original_frame = current_frame
+    depsgraph = context.evaluated_depsgraph_get()
+
+    # Clear any existing mesh ghosts first
+    clear_mesh_ghosts(context)
+
+    # Get or create the collection
+    coll = _get_or_create_collection(scene)
+
+    # Determine the actual mesh object to duplicate
+    mesh_obj = _resolve_mesh_object(source_obj)
+    if mesh_obj is None:
+        warn("No mesh object found for mesh ghost generation.")
+        return 0
+
+    # Compute the final list of frames to generate ghosts at
+    all_frames = _compute_desired_mesh_frames(
+        ghost_frames, current_frame, past_count, future_count, step
+    )
+
+    if not all_frames:
+        warn("No valid frames for mesh ghost generation.")
+        scene.frame_set(original_frame)
+        return 0
+
+    # Compute frame range for alpha falloff
+    min_frame = min(all_frames)
+    max_frame = max(all_frames)
+    frame_range_width = max(max_frame - min_frame, 1.0)
+
+    created = 0
+    failed = 0
+    use_wire = (mode == "WIRE")
+    mesh_settings = getattr(scene, 'ghost_tool', None)
+
+    for frame in all_frames:
+        ghost_obj = _evaluate_and_create_ghost_mesh(
+            context,
+            mesh_obj,
+            frame,
+            current_frame,
+            coll,
+            use_wire,
+            frame_range_width,
+            mesh_settings,
+        )
+        if ghost_obj is not None:
+            created += 1
+        else:
+            failed += 1
+
+    # Restore the original frame
+    scene.frame_set(original_frame)
+
+    if failed > 0:
+        log(f"Created {created} of {created + failed} mesh ghosts ({failed} failed to evaluate)")
+    else:
+        log(f"Created {created} mesh ghosts")
+
+    return created
+
+
+def _apply_outline_modifier(
+    ghost_obj: bpy.types.Object,
+    settings,
+    ghost_frame: float,
+    current_frame: float,
+) -> None:
+    """Add a Solidify modifier to a mesh ghost for outline rendering.
+
+    Creates a dark inverted-hull outline around the ghost mesh. The Solidify
+    modifier with flipped normals duplicates the mesh shell with reversed
+    geometry, and a separate dark material is assigned to this shell layer.
+    This technique produces a crisp silhouette effect even in solid shading
+    mode, making the ghost mesh edges stand out distinctly from the background.
+
+    Args:
+        ghost_obj:     The mesh ghost object.
+        settings:      GhostToolSceneSettings with outline params.
+        ghost_frame:   Frame of this ghost (for unique material naming).
+        current_frame: Scene's current frame.
+    """
+    width = settings.ghost_outline_width
+    outline_rgb = tuple(settings.ghost_outline_color)
+
+    # Create the outline material (opaque dark)
+    outline_mat_name = f"GhostOutline_{ghost_frame:.0f}"
+    outline_mat = bpy.data.materials.get(outline_mat_name)
+    if outline_mat is None:
+        outline_mat = bpy.data.materials.new(name=outline_mat_name)
+        outline_mat.use_nodes = True
+        outline_mat.diffuse_color = (*outline_rgb, 1.0)
+
+        tree = outline_mat.node_tree
+        tree.nodes.clear()
+        output = tree.nodes.new('ShaderNodeOutputMaterial')
+        output.location = (300, 0)
+        bsdf = tree.nodes.new('ShaderNodeBsdfPrincipled')
+        bsdf.location = (0, 0)
+        bsdf.inputs['Base Color'].default_value = (*outline_rgb, 1.0)
+        bsdf.inputs['Roughness'].default_value = 1.0
+        _set_shader_input(bsdf, ['Specular IOR Level', 'Specular'], 0.0)
+        tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+
+    # Add the outline material as the second slot on the ghost object
+    ghost_obj.data.materials.append(outline_mat)
+    outline_mat_idx = len(ghost_obj.data.materials) - 1
+
+    # Add Solidify modifier configured as inverted-hull outline
+    mod = ghost_obj.modifiers.new(name="GhostOutline", type='SOLIDIFY')
+    mod.thickness = -width  # Negative = grow inward → flip renders outward
+    mod.offset = -1.0
+    mod.use_flip_normals = True
+    mod.use_rim = False
+    mod.material_offset = outline_mat_idx  # Assign outline mat to shell
+
+
+def _resolve_mesh_object(obj: bpy.types.Object) -> Optional[bpy.types.Object]:
+    """Find the mesh object to use for onion skinning.
+
+    If the given object is an armature, look for a child mesh.
+    If it's already a mesh, use it directly.
+
+    Args:
+        obj: The active object.
+
+    Returns:
+        The mesh object, or None if no mesh is found.
+    """
+    if obj is None:
+        return None
+
+    if obj.type == 'MESH':
+        return obj
+
+    if obj.type == 'ARMATURE':
+        # Find the first child mesh with the most vertices (likely the body)
+        best_mesh = None
+        best_vertex_count = 0
+        for child in obj.children:
+            if child.type == 'MESH' and child.visible_get():
+                child_vertex_count = len(child.data.vertices)
+                if child_vertex_count > best_vertex_count:
+                    best_mesh = child
+                    best_vertex_count = child_vertex_count
+        return best_mesh
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+def clear_mesh_ghosts(context: bpy.types.Context) -> int:
+    """Remove all mesh ghost objects and their data.
+
+    Deletes every object in the GhostTool_MeshGhosts collection,
+    cleans up orphaned mesh data and materials, and removes the
+    collection itself.
+
+    Args:
+        context: Current Blender context.
+
+    Returns:
+        int: Number of mesh ghosts removed.
+    """
+    removed = 0
+
+    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    if coll is not None:
+        # Collect objects to remove
+        objects_to_remove = list(coll.objects)
+
+        for obj in objects_to_remove:
+            # Store mesh data ref before unlinking
+            mesh_data = obj.data if obj.type == 'MESH' else None
+
+            # Unlink from collection
+            coll.objects.unlink(obj)
+
+            # Remove the object
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+            # Remove orphaned mesh data
+            if mesh_data and mesh_data.users == 0:
+                bpy.data.meshes.remove(mesh_data)
+
+            removed += 1
+
+        # Remove the collection if empty
+        if len(coll.objects) == 0:
+            bpy.data.collections.remove(coll)
+
+    # Clean up ghost materials with zero users
+    mats_to_remove = [
+        mat for mat in bpy.data.materials
+        if mat.name.startswith("GhostMat_") and mat.users == 0
+    ]
+    for mat in mats_to_remove:
+        bpy.data.materials.remove(mat)
+
+    if removed > 0:
+        log(f"Cleared {removed} mesh ghosts")
+
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Visibility control
+# ---------------------------------------------------------------------------
+
+def update_mesh_ghost_visibility(
+    scene: bpy.types.Scene,
+    show_past: bool = True,
+    show_future: bool = True,
+    opacity_scale: float = 1.0,
+) -> None:
+    """Update visibility and opacity of all mesh ghosts in the scene.
+
+    Iterates over all mesh ghosts, showing or hiding them based on whether
+    they are in the past or future relative to the current frame, and scales
+    their material alpha by the given opacity_scale multiplier.
+
+    Args:
+        scene:         The Blender scene.
+        show_past:     Whether past-frame ghosts should be visible.
+        show_future:   Whether future-frame ghosts should be visible.
+        opacity_scale: Multiplier for ghost opacity (0.0–1.0).
+    """
+    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    if coll is None:
+        return
+
+    current_frame = scene.frame_current
+
+    for obj in coll.objects:
+        if not obj.get(GHOST_TOOL_MESH_GHOST_KEY):
+            continue
+
+        ghost_frame = obj.get(GHOST_TOOL_FRAME_KEY, 0)
+        is_past = ghost_frame < current_frame
+
+        # Visibility
+        if is_past:
+            obj.hide_viewport = not show_past
+        else:
+            obj.hide_viewport = not show_future
+
+        # Update material alpha based on opacity_scale
+        if obj.data and obj.data.materials:
+            mat = obj.data.materials[0]
+            if mat and mat.use_nodes and mat.node_tree:
+                # Find and update the Principled BSDF shader node
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        base_alpha = obj.get(GHOST_TOOL_BASE_ALPHA_KEY, MAX_ALPHA)
+                        node.inputs['Alpha'].default_value = base_alpha * opacity_scale
+                        break
+
+
+def set_mesh_ghost_display_mode(mode: str = "SOLID") -> None:
+    """Change display mode for all mesh ghosts.
+
+    Args:
+        mode: "SOLID", "WIRE", or "BOUNDS".
+    """
+    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    if coll is None:
+        return
+
+    for obj in coll.objects:
+        if obj.get(GHOST_TOOL_MESH_GHOST_KEY):
+            obj.display_type = mode
+
+
+# ---------------------------------------------------------------------------
+# Frame-change handler — auto-update mesh ghost positions
+# ---------------------------------------------------------------------------
+
+def _on_frame_change(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
+    """Handler called on frame change to update mesh ghost appearance.
+
+    Re-colours ghosts based on their relation to the new current frame
+    (past ghosts go blue, future ghosts go orange, alpha adjusts).
+
+    Registered/unregistered via register()/unregister() below.
+
+    Args:
+        scene:     The Blender scene.
+        depsgraph: The evaluated dependency graph.
+    """
+    if not hasattr(scene, 'ghost_tool'):
+        return
+
+    settings = scene.ghost_tool
+    if not settings.is_active or not settings.show_mesh_ghosts:
+        return
+
+    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    if coll is None or len(coll.objects) == 0:
+        return
+
+    current_frame = scene.frame_current
+
+    # Find frame range from existing ghosts
+    frames = [
+        obj.get(GHOST_TOOL_FRAME_KEY, 0) for obj in coll.objects
+        if obj.get(GHOST_TOOL_MESH_GHOST_KEY)
+    ]
+    if not frames:
+        return
+
+    frame_range_width = max(max(frames) - min(frames), 1.0)
+
+    for obj in coll.objects:
+        if not obj.get(GHOST_TOOL_MESH_GHOST_KEY):
+            continue
+
+        ghost_frame = obj.get(GHOST_TOOL_FRAME_KEY, 0)
+        is_past = ghost_frame < current_frame
+        obj[GHOST_TOOL_IS_PAST_KEY] = is_past
+
+        color, alpha = _compute_ghost_color_alpha(
+            ghost_frame, current_frame, frame_range_width, settings
+        )
+        obj[GHOST_TOOL_BASE_ALPHA_KEY] = alpha
+
+        # Update material colour and alpha
+        if obj.data and obj.data.materials:
+            mat = obj.data.materials[0]
+            if mat:
+                mat.diffuse_color = (*color, alpha)
+                if mat.use_nodes and mat.node_tree:
+                    for node in mat.node_tree.nodes:
+                        if node.type == 'BSDF_PRINCIPLED':
+                            node.inputs['Base Color'].default_value = (*color, 1.0)
+                            node.inputs['Alpha'].default_value = alpha
+                            break
+
+        # Show/hide based on settings
+        show_past = settings.show_mesh_past
+        show_future = settings.show_mesh_future
+        if is_past:
+            obj.hide_viewport = not show_past
+        else:
+            obj.hide_viewport = not show_future
+
+
+# ---------------------------------------------------------------------------
+# Incremental mesh ghost update (live mode)
+# ---------------------------------------------------------------------------
+
+def update_mesh_ghosts_incremental(
+    context: bpy.types.Context,
+) -> bool:
+    """Update existing mesh ghost vertex positions without recreating objects.
+
+    Instead of the expensive delete-and-recreate cycle, this function:
+    1. Checks if mesh ghost objects already exist
+    2. For each existing ghost, evaluates the deformed mesh at its frame
+    3. Writes the new vertex positions via foreach_set (fast bulk update)
+    4. Updates material colors based on new current-frame distance
+
+    This is designed for live mode — called by the pipeline on frame change.
+
+    Args:
+        context: Current Blender context.
+
+    Returns:
+        bool: True if update succeeded, False if a full rebuild is needed.
+    """
+    scene = context.scene
+    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+
+    if coll is None or len(coll.objects) == 0:
+        return False  # No existing ghosts — need full generate
+
+    settings = scene.ghost_tool
+    current_frame = scene.frame_current
+    original_frame = current_frame
+
+    # Gather existing ghost objects with their frame numbers
+    ghost_objects = []
+    for obj in coll.objects:
+        if obj.get(GHOST_TOOL_MESH_GHOST_KEY) and obj.type == 'MESH':
+            frame = obj.get(GHOST_TOOL_FRAME_KEY, None)
+            if frame is not None:
+                ghost_objects.append((frame, obj))
+
+    if not ghost_objects:
+        return False
+
+    # Check if we need to rebuild (frame window has shifted)
+    # For "around cursor" mode, the desired frames depend on current_frame
+    desired_frames = _compute_desired_mesh_frames_from_settings(settings, current_frame, scene)
+    # Note: _compute_desired_mesh_frames returns a set; convert existing frames to set for comparison
+
+    existing_frames = set(f for f, _ in ghost_objects)
+
+    # If the desired frame set doesn't match existing, we need a full rebuild
+    if desired_frames != existing_frames:
+        return False  # Signal caller to do a full rebuild
+
+    # Good — same frame set. Do incremental vertex update.
+    depsgraph = context.evaluated_depsgraph_get()
+
+    # Find the source mesh object (same logic as initial generation)
+    source_obj = context.active_object
+    if source_obj is None:
+        return False
+
+    mesh_obj = _resolve_mesh_object(source_obj)
+    if mesh_obj is None:
+        return False
+
+    # Compute frame range for color/alpha
+    all_frames = [f for f, _ in ghost_objects]
+    min_frame = min(all_frames)
+    max_frame = max(all_frames)
+    frame_range_width = max(max_frame - min_frame, 1.0)
+
+    success = True
+
+    for frame, ghost_obj in ghost_objects:
+        # Move to frame and evaluate
+        scene.frame_set(int(round(frame)))
+        depsgraph = context.evaluated_depsgraph_get()
+
+        eval_obj = mesh_obj.evaluated_get(depsgraph)
+        if eval_obj is None:
+            success = False
+            continue
+
+        try:
+            eval_mesh = eval_obj.to_mesh()
+        except RuntimeError:
+            success = False
+            continue
+
+        if eval_mesh is None:
+            success = False
+            continue
+
+        ghost_mesh = ghost_obj.data
+
+        # Check vertex count matches — if not, topology changed, need rebuild
+        if len(eval_mesh.vertices) != len(ghost_mesh.vertices):
+            eval_obj.to_mesh_clear()
+            success = False
+            break  # Topology mismatch — full rebuild required
+
+        # Fast bulk vertex position update via foreach_set
+        vertex_count = len(eval_mesh.vertices)
+        flattened_vertex_coords = [0.0] * (vertex_count * COORDS_PER_VERTEX)
+        eval_mesh.vertices.foreach_get('co', flattened_vertex_coords)
+        ghost_mesh.vertices.foreach_set('co', flattened_vertex_coords)
+
+        # Notify Blender that geometry changed
+        ghost_mesh.update()
+
+        # Clean up
+        eval_obj.to_mesh_clear()
+
+        # Update world matrix (in case armature moved)
+        ghost_obj.matrix_world = mesh_obj.matrix_world.copy()
+
+        # Update color/alpha based on new current frame
+        color, alpha = _compute_ghost_color_alpha(
+            frame, current_frame, frame_range_width
+        )
+        ghost_obj[GHOST_TOOL_IS_PAST_KEY] = (frame < current_frame)
+        ghost_obj[GHOST_TOOL_BASE_ALPHA_KEY] = alpha
+
+        if ghost_obj.data.materials:
+            mat = ghost_obj.data.materials[0]
+            if mat:
+                mat.diffuse_color = (*color, alpha)
+                if mat.use_nodes and mat.node_tree:
+                    for node in mat.node_tree.nodes:
+                        if node.type == 'BSDF_PRINCIPLED':
+                            node.inputs['Base Color'].default_value = (*color, 1.0)
+                            node.inputs['Alpha'].default_value = alpha
+                            break
+
+        # Update visibility
+        show_past = settings.show_mesh_past
+        show_future = settings.show_mesh_future
+        is_past = frame < current_frame
+        ghost_obj.hide_viewport = (not show_past) if is_past else (not show_future)
+
+    # Restore frame
+    scene.frame_set(original_frame)
+
+    return success
+
+
+def _get_keyframe_frames_for_object(obj: bpy.types.Object) -> list[float]:
+    """Collect all unique keyframe frame numbers from an object's animation data.
+
+    Examines the object's action f-curves (using the slotted-action compat
+    helper for Blender 4.4+/Bforartists 5.x) and returns a sorted list of
+    frame numbers where keyframes exist.
+
+    For armatures, also checks child objects (meshes with shape key actions)
+    to catch all keyframes that affect the visual result.
+
+    Args:
+        obj: The Blender object to inspect.
+
+    Returns:
+        list[float]: Sorted list of keyframe frame numbers.
+    """
+    from .utils import get_fcurves_from_action, debug
+
+    frames: set[float] = set()
+
+    # Collect from the object itself
+    anim_data = obj.animation_data
+    if anim_data and anim_data.action:
+        fcurves = get_fcurves_from_action(anim_data.action, obj)
+        debug(f"Keyframe scan: {obj.name} has {len(fcurves)} fcurves")
+        for fcurve in fcurves:
+            for kp in fcurve.keyframe_points:
+                frames.add(float(kp.co.x))
+
+    # For armatures, also scan children (they may have shape key actions)
+    if obj.type == 'ARMATURE':
+        for child in obj.children:
+            child_anim = child.animation_data
+            if child_anim and child_anim.action:
+                child_fcurves = get_fcurves_from_action(child_anim.action, child)
+                for fcurve in child_fcurves:
+                    for kp in fcurve.keyframe_points:
+                        frames.add(float(kp.co.x))
+
+    debug(f"Keyframe scan total: {len(frames)} unique keyframe frames for {obj.name}")
+    return sorted(frames)
+
+
+def _compute_desired_mesh_frames_from_settings(
+    settings,
+    current_frame: float,
+    scene: bpy.types.Scene,
+    obj: bpy.types.Object = None,
+) -> set[float]:
+    """Compute the set of frames that mesh ghosts should exist at.
+
+    Used by incremental update to detect when the frame window has shifted
+    and a full rebuild is needed instead. Reads past_count, future_count,
+    frame step, and frame mode from the scene settings.
+
+    Args:
+        settings: GhostToolSceneSettings.
+        current_frame: The scene's current frame.
+        scene: The Blender scene with frame_start and frame_end bounds.
+        obj: Optional object for keyframe lookup (needed for KEYFRAMES mode).
+
+    Returns:
+        set[float]: Desired frame numbers for mesh ghosts.
+    """
+    past_count = settings.mesh_ghost_past_count
+    future_count = settings.mesh_ghost_future_count
+    frame_step = settings.mesh_ghost_step
+    frame_mode = settings.mesh_ghost_frame_mode
+
+    frame_start_bound = scene.frame_start
+    frame_end_bound = scene.frame_end
+
+    if frame_mode == 'KEYFRAMES' and obj is not None:
+        # Only generate at keyframe positions
+        all_keyframes = _get_keyframe_frames_for_object(obj)
+
+        # Determine keyframe skip interval (every Nth keyframe)
+        kf_skip_enum = settings.mesh_ghost_keyframe_skip
+        if kf_skip_enum == 'CUSTOM':
+            kf_skip = max(1, settings.mesh_ghost_keyframe_skip_custom)
+        else:
+            kf_skip = max(1, int(kf_skip_enum))
+
+        # Past keyframes: sorted nearest-first (descending), then take every Nth
+        past_all = sorted(
+            [f for f in all_keyframes if f < current_frame and frame_start_bound <= f <= frame_end_bound],
+            reverse=True,
+        )
+        # Apply skip: from the nearest keyframe outward, take every Nth
+        # Index 0 = nearest past keyframe, so we pick indices 0, N, 2N, 3N...
+        past_frames = past_all[::kf_skip][:past_count]
+
+        # Future keyframes: sorted nearest-first (ascending), then take every Nth
+        future_all = sorted(
+            [f for f in all_keyframes if f > current_frame and frame_start_bound <= f <= frame_end_bound],
+        )
+        future_frames = future_all[::kf_skip][:future_count]
+
+        return set(past_frames + future_frames)
+
+    # Default STEP mode: regular frame intervals
+    frames = set()
+    for step_index in range(1, past_count + 1):
+        frame_number = current_frame - step_index * frame_step
+        if frame_start_bound <= frame_number <= frame_end_bound:
+            frames.add(float(frame_number))
+
+    for step_index in range(1, future_count + 1):
+        frame_number = current_frame + step_index * frame_step
+        if frame_start_bound <= frame_number <= frame_end_bound:
+            frames.add(float(frame_number))
+
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Operators
+# ---------------------------------------------------------------------------
+
+class GHOST_OT_generate_mesh_ghosts(bpy.types.Operator):
+    """Generate mesh onion skin ghosts for the active object."""
+
+    bl_idname = "ghost_tool.generate_mesh_ghosts"
+    bl_label = "Generate Mesh Ghosts"
+    bl_description = (
+        "Create transparent mesh duplicates at frames around the playhead "
+        "to visualize the character pose at different times"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        """Require an active mesh or armature object.
+
+        Args:
+            context: Current Blender context.
+
+        Returns:
+            bool: True if a valid source object exists.
+        """
+        obj = context.active_object
+        if obj is None:
+            return False
+        return obj.type in {'MESH', 'ARMATURE'}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Generate mesh ghost duplicates.
+
+        Args:
+            context: Current Blender context.
+
+        Returns:
+            set[str]: {'FINISHED'} on success.
+        """
+        scene = context.scene
+        settings = scene.ghost_tool
+        obj = context.active_object
+        current_frame = scene.frame_current
+
+        # Build the frame list from settings (respects STEP vs KEYFRAMES mode)
+        past_count = settings.mesh_ghost_past_count
+        future_count = settings.mesh_ghost_future_count
+        mode = settings.mesh_ghost_mode
+
+        ghost_frames = sorted(
+            _compute_desired_mesh_frames_from_settings(
+                settings, current_frame, scene, obj
+            )
+        )
+
+        frame_mode = settings.mesh_ghost_frame_mode
+        if not ghost_frames and frame_mode == 'KEYFRAMES':
+            self.report({'WARNING'}, "No keyframes found on this object — try Frame Step mode")
+            return {'CANCELLED'}
+
+        count = generate_mesh_ghosts(
+            context=context,
+            source_obj=obj,
+            ghost_frames=ghost_frames,
+            mode=mode,
+            past_count=past_count,
+            future_count=future_count,
+            step=1,  # step already applied above
+        )
+
+        # Activate mesh ghost display and live updates
+        if hasattr(settings, 'show_mesh_ghosts'):
+            settings.show_mesh_ghosts = True
+        settings.live_mesh_ghosts = True
+
+        mode_label = "at keyframes" if frame_mode == 'KEYFRAMES' else "frame-step"
+        self.report({'INFO'}, f"Created {count} mesh ghosts ({mode_label}, live update enabled)")
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+class GHOST_OT_clear_mesh_ghosts(bpy.types.Operator):
+    """Remove all mesh onion skin ghost objects."""
+
+    bl_idname = "ghost_tool.clear_mesh_ghosts"
+    bl_label = "Clear Mesh Ghosts"
+    bl_description = "Remove all transparent mesh ghost duplicates from the scene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Clear mesh ghosts.
+
+        Args:
+            context: Current Blender context.
+
+        Returns:
+            set[str]: {'FINISHED'}.
+        """
+        count = clear_mesh_ghosts(context)
+        self.report({'INFO'}, f"Removed {count} mesh ghosts")
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+class GHOST_OT_toggle_mesh_mode(bpy.types.Operator):
+    """Cycle mesh ghost display: Solid → Wire → Off."""
+
+    bl_idname = "ghost_tool.toggle_mesh_mode"
+    bl_label = "Toggle Mesh Ghost Mode"
+    bl_description = "Cycle through mesh ghost display modes: Solid, Wireframe, Off"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        """Always available; operates on the ghost collection.
+
+        Args:
+            context: Current Blender context.
+
+        Returns:
+            bool: True (always available).
+        """
+        return True
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Cycle display mode.
+
+        Args:
+            context: Current Blender context.
+
+        Returns:
+            set[str]: {'FINISHED'}.
+        """
+        settings = context.scene.ghost_tool
+        current = settings.mesh_ghost_mode
+
+        if current == 'SOLID':
+            settings.mesh_ghost_mode = 'WIRE'
+            set_mesh_ghost_display_mode('WIRE')
+            self.report({'INFO'}, "Mesh ghosts: Wireframe")
+        elif current == 'WIRE':
+            settings.show_mesh_ghosts = False
+            update_mesh_ghost_visibility(
+                context.scene, show_past=False, show_future=False
+            )
+            self.report({'INFO'}, "Mesh ghosts: Hidden")
+        else:
+            settings.mesh_ghost_mode = 'SOLID'
+            settings.show_mesh_ghosts = True
+            set_mesh_ghost_display_mode('SOLID')
+            update_mesh_ghost_visibility(context.scene)
+            self.report({'INFO'}, "Mesh ghosts: Solid")
+
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+_classes = (
+    GHOST_OT_generate_mesh_ghosts,
+    GHOST_OT_clear_mesh_ghosts,
+    GHOST_OT_toggle_mesh_mode,
+)
+
+
+def register() -> None:
+    """Register mesh ghost operators and frame-change handler."""
+    for cls in _classes:
+        bpy.utils.register_class(cls)
+
+    # Register the frame-change handler
+    if _on_frame_change not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_on_frame_change)
+
+    log("Mesh ghosts module registered.")
+
+
+def unregister() -> None:
+    """Unregister mesh ghost operators and clean up handler."""
+    # Remove frame-change handler
+    if _on_frame_change in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_on_frame_change)
+
+    for cls in reversed(_classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError as exc:
+            debug("Could not set frame during mesh ghost update")

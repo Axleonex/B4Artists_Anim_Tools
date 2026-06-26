@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Blender / Bforartists
+*.blend1
+*.blend2
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# LLM / internal references - NEVER publish to GitHub (keep these LOCAL only)
+*LLM*
+*llm*
+*_LLM_Reference.md
+CLAUDE.md
+AGENTS.md
+.cursorrules
+.cursor/
+.aider*
+copilot-instructions.md
+
+# Internal diagnostic reports - keep LOCAL only, never publish
+DIAGNOSTICS_REPORT_*.md
+*DIAGNOSTICS_REPORT*

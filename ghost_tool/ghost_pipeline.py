@@ -1,0 +1,1090 @@
+"""
+ghost_pipeline.py — Central orchestrator for the ghost generation pipeline.
+
+This module provides the GhostPipeline class, the single entry point for
+all ghost generation flows.  Whether the user clicks "Generate" manually,
+or live mode auto-updates on frame change, everything flows through here.
+
+Pipeline stages:
+    1. Frame Source — determine which frames to ghost (from settings)
+    2. Evaluate — sample f-curves and world positions at those frames
+    3. Cache — store results, check dirty flags
+    4. Notify — update GhostStore, tag viewport for redraw
+
+The pipeline also manages live-update handlers (frame_change_post,
+depsgraph_update_post) that are registered/unregistered based on the
+live_point_ghosts / live_mesh_ghosts settings.
+
+CRITICAL DESIGN NOTE:
+    Ghost generation calls scene.frame_set(), which is FORBIDDEN inside
+    draw handlers and frame_change handlers.  Live updates therefore use
+    bpy.app.timers to defer generation to the next idle tick.  The flow:
+        frame_change_post → mark_dirty + schedule timer
+        timer fires (safe context) → _run_live_update → scene.frame_set OK
+        viewport tagged for redraw → draw handler reads GhostStore only
+
+Design goals:
+    - Single code path for manual and live generation
+    - Throttled updates to prevent performance tanking during scrubbing
+    - Dirty-flag system so only changed data is re-evaluated
+    - Clean handler lifecycle tied to addon register/unregister
+    - Generation NEVER runs inside draw or handler contexts
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Optional
+
+import bpy
+
+from .ghost_data import (
+    Ghost,
+    GhostStore,
+    generate_ghosts,
+    generate_ghosts_frame_step,
+    generate_ghosts_at_keyframes,
+    build_frame_list_from_settings,
+    LOCATION_CHANNELS,
+)
+from .ghost_cache import GhostCache
+from .utils import log, warn, debug, get_scene_id, tag_viewport_redraw
+
+# ---------------------------------------------------------------------------
+# Bake state flags — read by the 2D draw handler for HUD and preview
+# ---------------------------------------------------------------------------
+
+_BAKE_IN_PROGRESS: bool = False
+"""True while a bake/generation is running.  The draw handler reads this
+to show the warm-up progress ring and render partial ghosts from the
+staging store."""
+
+_staging_store: Optional[GhostStore] = None
+"""Shadow buffer filled incrementally during a bake pass.  The 2D and 3D
+draw handlers render from this store when it is not None, providing a
+live preview of partially-baked ghosts.  Set to None when the bake
+completes and the results are swapped into the main GhostStore."""
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_THROTTLE_SEC: float = 0.05
+"""Minimum seconds between live updates (50ms = ~20 updates/sec max)."""
+
+# Timestamp (monotonic) of the last depsgraph_update_post callback execution.
+# Used to throttle expensive handler work during rapid scene updates.
+_last_depsgraph_check: float = 0.0
+
+# Timestamp (monotonic) of the last stale-instance pruning pass.
+# Prevents orphaned GhostPipeline/GhostCache objects from accumulating.
+_last_prune_time: float = 0.0
+
+# Whether a deferred live-update timer is already scheduled.
+# Prevents stacking multiple timers during rapid scrubbing.
+_deferred_update_pending: bool = False
+
+
+# ---------------------------------------------------------------------------
+# GhostPipeline — per-scene orchestrator
+# ---------------------------------------------------------------------------
+
+class GhostPipeline:
+    """Central orchestrator for ghost generation, caching, and live updates.
+
+    One GhostPipeline instance exists per scene, mirroring the GhostStore
+    and GhostCache singletons.  It coordinates:
+
+    - Manual generation (user clicks Generate)
+    - Live point ghost updates (frame_change_post)
+    - Live mesh ghost updates (frame_change_post, throttled)
+    - Dirty detection (settings changed, keyframe edited, frame moved)
+    - Throttling to prevent performance issues during scrubbing
+
+    Usage:
+        pipeline = GhostPipeline.get(scene)
+        pipeline.generate_manual(context)     # manual mode
+        pipeline.mark_dirty()                 # flag for live update
+        pipeline.update_if_needed(context)    # called from deferred timer
+    """
+
+    # Per-scene singleton instances
+    _instances: dict[str, GhostPipeline] = {}
+
+    # =========================================================================
+    # Initialization
+    # =========================================================================
+
+    def __init__(self, scene_id: str) -> None:
+        """Initialize the pipeline for a scene.
+
+        Args:
+            scene_id: The stable unique ID of the Blender scene this pipeline manages.
+        """
+        self._scene_id: str = scene_id
+        self._cache: Optional[GhostCache] = None
+
+    # --- Singleton access ---
+
+    @classmethod
+    def get(cls, scene: bpy.types.Scene) -> GhostPipeline:
+        """Retrieve or create the GhostPipeline for a scene.
+
+        Args:
+            scene: The Blender scene.
+
+        Returns:
+            GhostPipeline: The pipeline instance for this scene.
+        """
+        key = get_scene_id(scene)
+        if key not in cls._instances:
+            cls._instances[key] = cls(key)
+        return cls._instances[key]
+
+    @classmethod
+    def clear_instance(cls, scene_name: str) -> None:
+        """Remove the pipeline instance for a scene."""
+        cls._instances.pop(scene_name, None)
+
+    @classmethod
+    def clear_all_instances(cls) -> None:
+        """Remove all pipeline instances (addon unregistration)."""
+        cls._instances.clear()
+
+    @classmethod
+    def prune_stale(cls) -> int:
+        """Remove pipeline instances for scenes that no longer exist."""
+        import bpy
+        current_scene_ids = {get_scene_id(s) for s in bpy.data.scenes}
+        stale = [key for key in cls._instances if key not in current_scene_ids]
+        for key in stale:
+            del cls._instances[key]
+        return len(stale)
+
+    # --- Cache access ---
+
+    def _get_cache(self) -> GhostCache:
+        """Lazily get or create the cache for this scene.
+
+        Returns:
+            GhostCache: The cache instance.
+        """
+        if self._cache is None:
+            self._cache = GhostCache.get(self._scene_id)
+        return self._cache
+
+    # --- Dirty flag pass-through ---
+
+    def mark_dirty(self) -> None:
+        """Mark the pipeline as needing regeneration.
+
+        Called by frame_change or depsgraph_update handlers, or when
+        the user changes settings.
+        """
+        self._get_cache().mark_dirty()
+
+    def mark_object_dirty(self, object_name: str) -> None:
+        """Mark a specific object as needing re-evaluation.
+
+        Called when a keyframe is edited on a specific object.
+
+        Args:
+            object_name: The name of the modified object.
+        """
+        self._get_cache().mark_object_dirty(object_name)
+
+    # --- Manual generation (user clicks Generate) ---
+
+    def generate_manual(
+        self,
+        context: bpy.types.Context,
+        obj: bpy.types.Object,
+        armature: Optional[bpy.types.Object],
+        bones: list[str],
+        channels: list[str],
+        level: int,
+        frame_range: Optional[tuple[int, int]] = None,
+        clear_existing: bool = True,
+    ) -> int:
+        """Run a full ghost generation pass (manual / button-press mode).
+
+        This is the equivalent of the old generate_and_store_ghosts() but
+        routed through the pipeline for cache awareness.
+
+        Args:
+            context: The current Blender context.
+            obj: The object to generate ghosts for.
+            armature: The armature (or None).
+            bones: Pose bone names.
+            channels: Channel identifiers.
+            level: Subdivision depth (for SUBDIVISION mode).
+            frame_range: Optional frame range.
+            clear_existing: Whether to clear existing ghosts first.
+
+        Returns:
+            int: Number of ghosts generated.
+        """
+        cache = self._get_cache()
+        store = GhostStore.get(context.scene)
+        settings = context.scene.ghost_tool
+
+        if clear_existing:
+            store.clear()
+            cache.invalidate_all()
+
+        # Determine generation mode from settings; ghost_mode: SUBDIVISION, FRAME_STEP, or KEYFRAMES_ONLY
+        mode = settings.ghost_mode
+
+        debug(f"Manual generate: mode={mode}, obj={obj.name}")
+
+        # Run the appropriate generator
+        ghosts = self._evaluate_ghosts(
+            context, obj, armature, bones, channels, level, frame_range, mode, settings
+        )
+
+        # Store results
+        store.replace_all(ghosts)
+
+        # Update cache metadata
+        cache.last_frame = context.scene.frame_current
+        cache.update_settings_hash(compute_settings_hash(settings))
+        cache.mark_clean()
+
+        debug(f"Generated {len(ghosts)} ghosts, cache clean.")
+
+        return len(ghosts)
+
+    def generate_manual_with_preview(
+        self,
+        context: bpy.types.Context,
+        obj: bpy.types.Object,
+        armature: Optional[bpy.types.Object],
+        bones: list[str],
+        channels: list[str],
+        level: int,
+        frame_range: Optional[tuple[int, int]] = None,
+        clear_existing: bool = True,
+    ) -> int:
+        """Run a full ghost generation pass with live preview via shadow buffer.
+
+        Identical to ``generate_manual()`` but populates ``_staging_store``
+        ghost-by-ghost so the draw handler can render partial results while
+        the bake is in progress.  The ``_BAKE_IN_PROGRESS`` flag is set for
+        the duration of the bake so the Mode Label HUD and Progress Ring are
+        active.
+
+        On completion the staging contents are atomically swapped into the
+        main ``GhostStore`` and the bake flags are cleared.
+
+        Args:
+            context: The current Blender context.
+            obj: The object to generate ghosts for.
+            armature: The armature (or None).
+            bones: Pose bone names.
+            channels: Channel identifiers.
+            level: Subdivision depth (for SUBDIVISION mode).
+            frame_range: Optional frame range.
+            clear_existing: Whether to clear existing ghosts first.
+
+        Returns:
+            int: Number of ghosts generated.
+        """
+        global _BAKE_IN_PROGRESS, _staging_store
+
+        cache = self._get_cache()
+        store = GhostStore.get(context.scene)
+        settings = context.scene.ghost_tool
+
+        if clear_existing:
+            store.clear()
+            cache.invalidate_all()
+
+        mode = settings.ghost_mode
+        debug(f"Manual generate (with preview): mode={mode}, obj={obj.name}")
+
+        # --- Shadow buffer setup ---
+        _staging_store = GhostStore()
+        _BAKE_IN_PROGRESS = True
+        # Initialize here so the finally block always has a valid reference
+        # even if _evaluate_ghosts raises before populating the staging store.
+        final_ghosts: list[Ghost] = []
+
+        try:
+            # Evaluate all ghosts first, then populate the staging store atomically.
+            # True ghost-by-ghost streaming would require converting _evaluate_ghosts
+            # to a generator; the current batch-populate approach means the staging
+            # store is fully populated before the first viewport preview, but the
+            # _BAKE_IN_PROGRESS flag and progress ring are still visible during the
+            # evaluation phase.
+            all_ghosts: list[Ghost] = self._evaluate_ghosts(
+                context, obj, armature, bones, channels, level, frame_range, mode, settings
+            )
+            _staging_store.replace_all(all_ghosts)
+            final_ghosts = all_ghosts
+            tag_viewport_redraw(context)
+
+        finally:
+            # Atomic swap: move staging into the main store regardless of outcome
+            store.replace_all(final_ghosts)
+            _BAKE_IN_PROGRESS = False
+            _staging_store = None
+
+        # Update cache metadata
+        cache.last_frame = context.scene.frame_current
+        cache.update_settings_hash(compute_settings_hash(settings))
+        cache.mark_clean()
+
+        debug(f"Generated {len(final_ghosts)} ghosts (with preview), cache clean.")
+        tag_viewport_redraw(context)
+        return len(final_ghosts)
+
+    # --- Live update check (called from draw handler or timer) ---
+
+    def update_if_needed(self, context: bpy.types.Context) -> bool:
+        """Check if regeneration is needed and run it if so.
+
+        This is designed to be called frequently (e.g., every draw cycle).
+        It checks dirty flags and throttle timing before doing any work.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            bool: True if an update was performed.
+        """
+        scene = context.scene
+        if not hasattr(scene, 'ghost_tool'):
+            return False
+
+        settings = scene.ghost_tool
+
+        # Only run if any live mode is enabled
+        live_points = settings.live_point_ghosts
+        live_mesh = settings.live_mesh_ghosts
+        if not live_points and not live_mesh:
+            return False
+
+        # Check freeze
+        if settings.live_freeze:
+            return False
+
+        # Skip during playback to avoid performance issues
+        if context.screen and context.screen.is_animation_playing:
+            return False
+
+        cache = self._get_cache()
+
+        # Check if anything changed
+        current_frame = scene.frame_current
+        new_hash = compute_settings_hash(settings)
+
+        frame_changed = cache.last_frame != current_frame
+        settings_changed = cache.needs_settings_update(new_hash)
+
+        if not frame_changed and not settings_changed and not cache.is_dirty:
+            debug("Settings hash unchanged, skipping regeneration")
+            return False
+
+        # Throttle check
+        throttle_ms = settings.live_throttle_ms
+        throttle_sec = throttle_ms / 1000.0
+        now = time.monotonic()
+        if now - cache.last_update_time <= throttle_sec:
+            return False
+
+        reason = []
+        if frame_changed:
+            reason.append(f"frame:{cache.last_frame}->{current_frame}")
+        if settings_changed:
+            reason.append("settings")
+        if cache.is_dirty:
+            reason.append("dirty")
+        debug(f"Live update triggered: {', '.join(reason)}")
+
+        # Run the generation
+        self._run_live_update(context, settings, new_hash)
+        return True
+
+    # =========================================================================
+    # Live Updates
+    # =========================================================================
+
+    def _run_live_update(
+        self,
+        context: bpy.types.Context,
+        settings: bpy.types.PropertyGroup,
+        settings_hash: str,
+    ) -> None:
+        """Execute a live regeneration pass.
+
+        Uses the same generation logic as manual mode but operates on
+        the active object automatically.
+
+        Args:
+            context: The Blender context.
+            settings: GhostToolSceneSettings.
+            settings_hash: Pre-computed hash of current settings.
+        """
+        obj = context.active_object
+        if not obj:
+            return
+
+        cache = self._get_cache()
+
+        live_points = settings.live_point_ghosts
+        live_mesh = settings.live_mesh_ghosts
+
+        # Update point ghosts if enabled
+        if live_points:
+            self._update_point_ghosts_live(context, obj, settings)
+
+        # Update cache state
+        cache.last_frame = context.scene.frame_current
+        cache.update_settings_hash(settings_hash)
+        cache.mark_clean()
+
+        # Update mesh ghosts if enabled
+        if live_mesh and settings.show_mesh_ghosts:
+            self._update_mesh_ghosts_live(context, settings)
+
+        # Tag viewport for redraw
+        tag_viewport_redraw(context)
+
+    def _update_point_ghosts_live(
+        self,
+        context: bpy.types.Context,
+        obj: bpy.types.Object,
+        settings: bpy.types.PropertyGroup,
+    ) -> None:
+        """Update point ghosts in live mode.
+
+        Evaluates and stores point ghosts for the active object if it has
+        animation data. Skips silently if there's no animation.
+
+        Args:
+            context: Blender context.
+            obj: The object to update point ghosts for.
+            settings: GhostToolSceneSettings.
+        """
+        if not obj.animation_data or not obj.animation_data.action:
+            # No animation data — can't generate point ghosts
+            debug(f"No animation data on {obj.name}, skipping live update")
+            return
+
+        store = GhostStore.get(context.scene)
+
+        # Determine bones and armature
+        bones: list[str] = []
+        armature = None
+        if obj.type == 'ARMATURE':
+            armature = obj
+            # Try selected pose bones first (Pose Mode)
+            if context.selected_pose_bones:
+                bones = [b.name for b in context.selected_pose_bones]
+            elif obj.data.bones:
+                # Try bones marked as selected
+                bones = [b.name for b in obj.data.bones if b.select]
+            # Fallback: use all bones if none are selected (e.g. Object Mode)
+            if not bones and obj.pose and obj.pose.bones:
+                bones = [b.name for b in obj.pose.bones]
+
+        # Determine frame range; ghost_range_mode: AROUND_CURSOR, FULL_TIMELINE, BETWEEN_KEYS, or CUSTOM
+        frame_range = None
+        range_mode = settings.ghost_range_mode
+        if range_mode == "CUSTOM":
+            frame_range = (settings.custom_range_start, settings.custom_range_end)
+        elif range_mode == "FULL_TIMELINE":
+            frame_range = (context.scene.frame_start, context.scene.frame_end)
+
+        mode = settings.ghost_mode
+        channels = LOCATION_CHANNELS
+
+        # Evaluate and store
+        ghosts = self._evaluate_ghosts(
+            context, obj, armature, bones, channels,
+            settings.subdivision_level, frame_range, mode, settings
+        )
+        store.replace_all(ghosts)
+
+    def _update_mesh_ghosts_live(
+        self,
+        context: bpy.types.Context,
+        settings: bpy.types.PropertyGroup,
+    ) -> None:
+        """Attempt incremental mesh ghost update; fall back to full rebuild.
+
+        First tries the fast foreach_set path.  If that fails (frame window
+        shifted, topology changed, no existing ghosts), does a full
+        generate_mesh_ghosts() call instead.
+
+        Args:
+            context: Blender context.
+            settings: GhostToolSceneSettings.
+        """
+        try:
+            from .mesh_ghosts import (
+                update_mesh_ghosts_incremental,
+                generate_mesh_ghosts,
+                _resolve_mesh_object,
+                _compute_desired_mesh_frames_from_settings,
+            )
+
+            # Try incremental first (fast path)
+            success = update_mesh_ghosts_incremental(context)
+
+            if not success:
+                # Need full rebuild — frame window shifted or no existing ghosts
+                obj = context.active_object
+                if obj is None:
+                    return
+
+                mesh_obj = _resolve_mesh_object(obj)
+                if mesh_obj is None:
+                    return
+
+                current_frame = context.scene.frame_current
+                past_count = settings.mesh_ghost_past_count
+                future_count = settings.mesh_ghost_future_count
+                # mesh_ghost_mode: display style for mesh ghosts (SOLID, WIREFRAME, BOUNDS)
+                mode = settings.mesh_ghost_mode
+
+                # Use the unified frame computation (handles both STEP and KEYFRAMES modes)
+                ghost_frames = sorted(
+                    _compute_desired_mesh_frames_from_settings(
+                        settings, current_frame, context.scene, obj
+                    )
+                )
+
+                generate_mesh_ghosts(
+                    context=context,
+                    source_obj=obj,
+                    ghost_frames=ghost_frames,
+                    mode=mode,
+                    past_count=past_count,
+                    future_count=future_count,
+                    step=1,
+                )
+
+                debug("Mesh ghosts: full rebuild")
+            else:
+                debug("Mesh ghosts: incremental update")
+
+        except Exception as exc:
+            warn(f"Mesh ghost update error: {exc}")
+
+    # =========================================================================
+    # Ghost Evaluation (shared by manual and live)
+    # =========================================================================
+
+    def _evaluate_ghosts(
+        self,
+        context: bpy.types.Context,
+        obj: bpy.types.Object,
+        armature: Optional[bpy.types.Object],
+        bones: list[str],
+        channels: list[str],
+        level: int,
+        frame_range: Optional[tuple[int, int]],
+        mode: str,
+        settings: bpy.types.PropertyGroup,
+    ) -> list[Ghost]:
+        """Evaluate ghosts using the appropriate generator.
+
+        This is the shared evaluation logic used by both manual and live
+        generation paths.
+
+        Args:
+            context: Blender context.
+            obj: Target object.
+            armature: Armature (or None).
+            bones: Bone names.
+            channels: Channel identifiers.
+            level: Subdivision depth.
+            frame_range: Optional frame range.
+            mode: Ghost mode string (SUBDIVISION, FRAME_STEP, KEYFRAMES_ONLY).
+            settings: GhostToolSceneSettings.
+
+        Returns:
+            list[Ghost]: Evaluated ghost objects.
+        """
+        # FRAME_STEP mode: generate ghosts at fixed frame intervals
+        if mode == "FRAME_STEP":
+            frame_list = build_frame_list_from_settings(settings, context.scene)
+            return generate_ghosts_frame_step(obj, armature, bones, channels, frame_list)
+        # KEYFRAMES_ONLY mode: generate ghosts only at existing keyframes
+        elif mode == "KEYFRAMES_ONLY":
+            return generate_ghosts_at_keyframes(obj, armature, bones, channels, frame_range)
+        else:
+            # SUBDIVISION — original mode or unknown mode fallback
+            if mode != "SUBDIVISION":
+                warn(f"Unknown ghost mode '{mode}', falling back to SUBDIVISION")
+            return generate_ghosts(obj, armature, bones, channels, level, frame_range)
+
+    # =========================================================================
+    # Cache Management
+    # =========================================================================
+
+    def clear(self, context: bpy.types.Context) -> int:
+        """Clear all ghosts and cache for this scene.
+
+        Args:
+            context: Blender context.
+
+        Returns:
+            int: Number of ghosts that were cleared.
+        """
+        store = GhostStore.get(context.scene)
+        count = len(store)
+        store.clear()
+
+        cache = self._get_cache()
+        cache.invalidate_all()
+
+        debug(f"Cleared {count} ghosts + cache.")
+
+        return count
+
+
+# ---------------------------------------------------------------------------
+# Settings hash — detect when properties change
+# ---------------------------------------------------------------------------
+
+# WARNING: When adding new settings properties to GhostToolSceneSettings,
+# you MUST add them here too, or cache invalidation will silently break.
+def compute_settings_hash(settings: bpy.types.PropertyGroup) -> str:
+    """Compute a hash string from ghost tool settings for change detection.
+
+    This captures all settings that affect ghost generation so the pipeline
+    can detect when regeneration is needed. Any change to these properties
+    invalidates the cache and triggers a full regeneration on the next update.
+
+    Args:
+        settings: GhostToolSceneSettings PropertyGroup.
+
+    Returns:
+        str: A short hash string representing the current settings state.
+    """
+    # Only include properties that affect ghost GENERATION (positions, frames, counts).
+    # Rendering-only properties (colors, visibility, line styles) should NOT be included
+    # because they don't change which ghosts exist or where they are.
+    # Current generation-affecting property count: 16
+    # Collect all generation-affecting properties into a fingerprint tuple
+    # NOTE: When adding new settings to GhostToolSceneSettings, add them here too
+    settings_fingerprint = (
+        settings.ghost_mode,
+        settings.ghost_range_mode,
+        settings.subdivision_level,
+        settings.frame_step,
+        settings.ghosts_before,
+        settings.ghosts_after,
+        settings.custom_range_start,
+        settings.custom_range_end,
+        settings.show_mesh_ghosts,
+        settings.mesh_ghost_past_count,
+        settings.mesh_ghost_future_count,
+        settings.mesh_ghost_step,
+        settings.mesh_ghost_opacity,
+        settings.mesh_ghost_frame_mode,
+        settings.mesh_ghost_keyframe_skip,
+        settings.mesh_ghost_keyframe_skip_custom,
+    )
+
+    # Use a fast hash — we don't need cryptographic strength
+    return str(hash(settings_fingerprint))
+
+
+# ---------------------------------------------------------------------------
+# Handler Management for Live Mode
+# ---------------------------------------------------------------------------
+
+# Module-level references for handler registration/removal.
+# These store handler function objects to enable safe unregistration later.
+_frame_change_handler = None
+_depsgraph_update_handler = None
+
+
+# ---------------------------------------------------------------------------
+# Deferred live update — runs generation via bpy.app.timers, outside draw
+# ---------------------------------------------------------------------------
+
+def _schedule_deferred_update() -> None:
+    """Schedule a deferred live update if one isn't already pending.
+
+    Uses bpy.app.timers to run the generation on the next idle tick,
+    safely outside any draw handler or frame_change handler context
+    where scene.frame_set() is forbidden.
+    """
+    global _deferred_update_pending
+    if _deferred_update_pending:
+        return
+    _deferred_update_pending = True
+    bpy.app.timers.register(_deferred_live_update, first_interval=0.0)
+
+
+def _deferred_live_update() -> None:
+    """Timer callback that performs the actual live ghost regeneration.
+
+    This runs in a safe context where scene.frame_set() is allowed.
+    Returns None to run only once (no repeat).
+    """
+    global _deferred_update_pending
+    _deferred_update_pending = False
+
+    try:
+        context = bpy.context
+        scene = context.scene
+        if not scene or not hasattr(scene, 'ghost_tool'):
+            return None
+
+        settings = scene.ghost_tool
+        if not settings.is_active:
+            return None
+
+        live_points = settings.live_point_ghosts
+        live_mesh = settings.live_mesh_ghosts
+        if not live_points and not live_mesh:
+            return None
+
+        if settings.live_freeze:
+            return None
+
+        # Skip during animation playback to avoid performance issues
+        if context.screen and context.screen.is_animation_playing:
+            return None
+
+        pipeline = GhostPipeline.get(scene)
+        cache = pipeline._get_cache()
+
+        # Throttle check
+        throttle_ms = settings.live_throttle_ms
+        throttle_sec = throttle_ms / 1000.0
+        now = time.monotonic()
+        if now - cache.last_update_time <= throttle_sec:
+            # Re-schedule if we're throttled but still dirty
+            if cache.is_dirty:
+                _deferred_update_pending = True
+                bpy.app.timers.register(
+                    _deferred_live_update,
+                    first_interval=max(0.01, throttle_sec - (now - cache.last_update_time)),
+                )
+            return None
+
+        # Check if anything actually changed
+        current_frame = scene.frame_current
+        new_hash = compute_settings_hash(settings)
+        frame_changed = cache.last_frame != current_frame
+        settings_changed = cache.needs_settings_update(new_hash)
+
+        if not frame_changed and not settings_changed and not cache.is_dirty:
+            return None
+
+        reason = []
+        if frame_changed:
+            reason.append(f"frame:{cache.last_frame}->{current_frame}")
+        if settings_changed:
+            reason.append("settings")
+        if cache.is_dirty:
+            reason.append("dirty")
+        debug(f"Deferred live update triggered: {', '.join(reason)}")
+
+        # Run the actual generation
+        pipeline._run_live_update(context, settings, new_hash)
+
+        # Tag viewport for redraw to show the new ghosts
+        tag_viewport_redraw(context)
+
+    except Exception as exc:
+        warn(f"Deferred live update error: {exc}")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Forced mesh ghost regeneration — bypasses live-mode checks
+# ---------------------------------------------------------------------------
+_forced_mesh_regen_pending = False
+_in_forced_regen = False  # Guard: suppresses depsgraph handler during forced rebuild
+
+
+def _schedule_forced_mesh_regen() -> None:
+    """Schedule a forced mesh ghost regeneration via timer.
+
+    Unlike _schedule_deferred_update(), this bypasses the live-mode gate
+    so that settings changes (e.g. switching Frame Step <-> Keyframes Only)
+    take effect immediately regardless of whether live mode is on or off.
+    """
+    global _forced_mesh_regen_pending
+    if _forced_mesh_regen_pending:
+        return
+    _forced_mesh_regen_pending = True
+    bpy.app.timers.register(_forced_mesh_regen_callback, first_interval=0.0)
+
+
+def _forced_mesh_regen_callback() -> None:
+    """Timer callback that forces a FULL mesh ghost rebuild.
+
+    Unlike _update_mesh_ghosts_live which tries incremental first,
+    this always clears and fully regenerates so that frame list changes
+    (e.g. switching Frame Step <-> Keyframes Only) take effect immediately.
+    """
+    global _forced_mesh_regen_pending, _in_forced_regen
+    _forced_mesh_regen_pending = False
+
+    try:
+        context = bpy.context
+        scene = context.scene
+        if not scene or not hasattr(scene, 'ghost_tool'):
+            return None
+
+        settings = scene.ghost_tool
+        if not settings.is_active or not settings.show_mesh_ghosts:
+            return None
+
+        from .mesh_ghosts import (
+            clear_mesh_ghosts,
+            generate_mesh_ghosts,
+            _resolve_mesh_object,
+            _compute_desired_mesh_frames_from_settings,
+        )
+
+        # Set guard so depsgraph handler ignores our clear/generate operations
+        _in_forced_regen = True
+
+        frame_mode = settings.mesh_ghost_frame_mode
+        print(f"[GhostTool] Forced regen START (frame_mode={frame_mode})")
+
+        # Always clear first — the frame list may have changed entirely
+        clear_mesh_ghosts(context)
+
+        obj = context.active_object
+        if obj is None:
+            print("[GhostTool] Forced regen ABORT: no active object")
+            return None
+
+        mesh_obj = _resolve_mesh_object(obj)
+        if mesh_obj is None:
+            print(f"[GhostTool] Forced regen ABORT: no mesh for {obj.name}")
+            return None
+
+        current_frame = scene.frame_current
+        past_count = settings.mesh_ghost_past_count
+        future_count = settings.mesh_ghost_future_count
+        mode = settings.mesh_ghost_mode
+
+        ghost_frames = sorted(
+            _compute_desired_mesh_frames_from_settings(
+                settings, current_frame, scene, obj
+            )
+        )
+
+        print(f"[GhostTool] Forced regen: {len(ghost_frames)} frames "
+              f"(mode={frame_mode}, past={past_count}, future={future_count}, "
+              f"cur={current_frame}) → {ghost_frames[:8]}{'...' if len(ghost_frames) > 8 else ''}")
+
+        if ghost_frames:
+            generate_mesh_ghosts(
+                context=context,
+                source_obj=obj,
+                ghost_frames=ghost_frames,
+                mode=mode,
+                past_count=past_count,
+                future_count=future_count,
+                step=1,
+            )
+
+        # Update cache state so the pipeline knows we're current
+        pipeline = GhostPipeline.get(scene)
+        cache = pipeline._get_cache()
+        cache.last_frame = current_frame
+        new_hash = compute_settings_hash(settings)
+        cache.update_settings_hash(new_hash)
+        cache.mark_clean()
+
+        # Tag viewport for redraw
+        tag_viewport_redraw(context)
+
+        print(f"[GhostTool] Forced regen DONE")
+
+    except Exception as exc:
+        warn(f"Forced mesh regen error: {exc}")
+    finally:
+        _in_forced_regen = False
+
+    return None
+
+
+def _on_frame_change_pipeline(scene: bpy.types.Scene, depsgraph=None) -> None:
+    """Handler called on frame_change_post.
+
+    Schedules a deferred live update via bpy.app.timers so that ghost
+    generation (which calls scene.frame_set) runs outside the draw/handler
+    context where frame_set is forbidden.
+
+    Args:
+        scene: The scene that changed.
+        depsgraph: The dependency graph (unused, but required by Blender).
+    """
+    if not hasattr(scene, 'ghost_tool'):
+        return
+
+    settings = scene.ghost_tool
+    if not settings.is_active:
+        return
+
+    # Only schedule if any live mode is enabled
+    live_points = settings.live_point_ghosts
+    live_mesh = settings.live_mesh_ghosts
+    if not live_points and not live_mesh:
+        return
+
+    if settings.live_freeze:
+        return
+
+    pipeline = GhostPipeline.get(scene)
+    pipeline.mark_dirty()
+    _schedule_deferred_update()
+
+
+def _on_depsgraph_update_pipeline(scene: bpy.types.Scene, depsgraph=None) -> None:
+    """Handler called on depsgraph_update_post.
+
+    Detects keyframe edits and marks the affected object dirty so live update
+    will regenerate ghosts on the next draw cycle.
+
+    Args:
+        scene: The scene that was updated.
+        depsgraph: The dependency graph with update info.
+    """
+    if not hasattr(scene, 'ghost_tool'):
+        return
+
+    # Skip if a forced regen is in progress — our own clear/generate
+    # operations trigger depsgraph updates that would cause a race condition
+    if _in_forced_regen:
+        return
+
+    settings = scene.ghost_tool
+    if not settings.is_active:
+        return
+
+    # Only check depsgraph updates if any live mode is enabled
+    live_points = settings.live_point_ghosts
+    live_mesh = settings.live_mesh_ghosts
+    if not live_points and not live_mesh:
+        return
+
+    if depsgraph is None:
+        return
+
+    # Time-based debounce to cap at ~60Hz
+    global _last_depsgraph_check, _last_prune_time
+    now = time.monotonic()
+    if now - _last_depsgraph_check < 0.016:  # Cap at ~60Hz
+        return
+    _last_depsgraph_check = now
+
+    # Periodically prune caches for deleted scenes (every ~60 seconds)
+    if now - _last_prune_time > 60.0:
+        GhostCache.prune_stale_scenes()
+        GhostPipeline.prune_stale()
+        _last_prune_time = now
+
+    pipeline = GhostPipeline.get(scene)
+
+    # Check if any animation data was updated (Action or Object with animation)
+    for update in depsgraph.updates:
+        if hasattr(update, 'id') and update.id is not None:
+            # If an Action or Object was updated, mark dirty and schedule regeneration
+            if isinstance(update.id, (bpy.types.Action, bpy.types.Object)):
+                pipeline.mark_dirty()
+                _schedule_deferred_update()
+                break
+
+
+def _register_live_handlers() -> None:
+    """Register frame_change and depsgraph handlers for live mode.
+
+    Safe to call multiple times — checks for existing registration.
+    """
+    global _frame_change_handler, _depsgraph_update_handler
+
+    if _frame_change_handler is None:
+        _frame_change_handler = _on_frame_change_pipeline
+        if _frame_change_handler not in bpy.app.handlers.frame_change_post:
+            bpy.app.handlers.frame_change_post.append(_frame_change_handler)
+            debug("Registered frame_change_post handler.")
+
+    if _depsgraph_update_handler is None:
+        _depsgraph_update_handler = _on_depsgraph_update_pipeline
+        if _depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(_depsgraph_update_handler)
+            debug("Registered depsgraph_update_post handler.")
+
+
+def _unregister_live_handlers() -> None:
+    """Remove frame_change and depsgraph handlers.
+
+    Safe to call multiple times — handles already-removed handlers gracefully.
+    """
+    global _frame_change_handler, _depsgraph_update_handler
+
+    if _frame_change_handler is not None:
+        try:
+            bpy.app.handlers.frame_change_post.remove(_frame_change_handler)
+        except ValueError:
+            debug("Handler frame_change_post already removed")
+        _frame_change_handler = None
+        debug("Unregistered frame_change_post handler.")
+
+    if _depsgraph_update_handler is not None:
+        try:
+            bpy.app.handlers.depsgraph_update_post.remove(_depsgraph_update_handler)
+        except ValueError:
+            debug("Handler depsgraph_update_post already removed")
+        _depsgraph_update_handler = None
+        debug("Unregistered depsgraph_update_post handler.")
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+def register() -> None:
+    """Register the pipeline module.
+
+    Registers live-mode app handlers.  The handlers are lightweight
+    (just set a dirty flag) so they're always registered — the pipeline's
+    update_if_needed() checks the live toggle before doing real work.
+    """
+    _register_live_handlers()
+    from .session_state import _on_undo_redo
+    if _on_undo_redo not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(_on_undo_redo)
+    if _on_undo_redo not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(_on_undo_redo)
+    log("Ghost pipeline registered.")
+
+
+def unregister() -> None:
+    """Unregister the pipeline module.
+
+    Removes app handlers and clears all pipeline instances.
+    """
+    from .session_state import _on_undo_redo
+    try:
+        bpy.app.handlers.undo_post.remove(_on_undo_redo)
+    except ValueError:
+        debug("Handler already removed")
+    try:
+        bpy.app.handlers.redo_post.remove(_on_undo_redo)
+    except ValueError:
+        debug("Handler already removed")
+    global _deferred_update_pending, _forced_mesh_regen_pending, _in_forced_regen
+    _deferred_update_pending = False
+    _forced_mesh_regen_pending = False
+    _in_forced_regen = False
+    _unregister_live_handlers()
+    GhostPipeline.clear_all_instances()
+    GhostCache.clear_all_instances()
+    log("Ghost pipeline unregistered.")

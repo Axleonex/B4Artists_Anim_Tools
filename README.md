@@ -1,0 +1,50 @@
+# B4Artists Anim Tools
+
+Two animation add-ons for **Bforartists** (the Blender fork). Both are **Bforartists-exclusive** — they do not run on standard Blender.
+
+| Tool | Version | What it does |
+|---|---|---|
+| **Anim Assist** | 12.0.1 | A production animation workflow suite (~400 operators across 11 feature phases): key editing, breakdowns, trajectory polish, retiming, proxies, IK/FK matching, mirroring, animation layers, and a hybrid PREVIEW/SHIPPED lipsync system. Inspired by Maya's AnimBot. |
+| **Ghost Tool** | 3.3.0 | Ghost keyframe visualization and manipulation: generates draggable in-between markers in 3D space and recalculates f-curves live. Includes onion skinning, motion trails, easing presets, snapshots, Physics Feel archetypes, and Visual Diff Mode. |
+
+> These tools were built with heavy AI assistance and are under active bug-fixing. If you hit an issue, a screenshot or a note about what you were doing helps a lot — please open an [issue](../../issues).
+
+## Download & install
+
+The ready-to-install add-ons live in [`releases/`](releases/):
+
+- `b4_anim_assist_v12.0.1_low_jitter.zip`
+- `b4_ghost_tool_v7.zip`
+
+To install in Bforartists:
+
+1. **Edit -> Preferences -> Add-ons -> Install from Disk...**
+2. Pick the `.zip` for the tool you want.
+3. Enable the add-on by ticking its checkbox.
+4. Open the **N-panel** in the 3D Viewport — Anim Assist adds tabs (Keys, Pose, Motion, Rig, Workspace, Layers, Lipsync); Ghost Tool adds a **Ghost Tool** tab.
+
+You don't need to unzip anything by hand — Bforartists installs directly from the `.zip`.
+
+## Browse the source
+
+The unpacked, readable source for each tool is in this repository so you can read it on GitHub without downloading anything:
+
+- [`anim_assist/`](anim_assist/) — Anim Assist source (`core/`, `operators/`, `ui/`, `tests/`)
+- [`ghost_tool/`](ghost_tool/) — Ghost Tool source
+
+The source folders and the `releases/` zips contain the same code; the zips are just packaged for one-click install.
+
+## Documentation
+
+Human-readable manuals and diagnostic reports are in [`docs/`](docs/):
+
+- [`docs/anim_assist/`](docs/anim_assist/) — Anim Assist user manual (PDF) + diagnostics report
+- [`docs/ghost_tool/`](docs/ghost_tool/) — Ghost Tool user manual (PDF) + diagnostics report
+
+## Requirements
+
+- **Bforartists 4.2+** (Anim Assist) / **Bforartists 4.x** (Ghost Tool). Not compatible with standard Blender.
+
+## License
+
+Released under the **GNU General Public License v2.0 or later** — see [`LICENSE`](LICENSE).
