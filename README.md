@@ -25,12 +25,6 @@ To install in Bforartists:
 
 You don't need to unzip anything by hand — Bforartists installs directly from the `.zip`.
 
-### Extended help
-
-Each add-on has a **Show Extended Help Popups** switch in its installed add-on
-settings. Turning it off hides only that add-on's `?` buttons and detailed
-popups. Native Bforartists hover tooltips remain enabled.
-
 ## Browse the source
 
 The unpacked, readable source for each tool is in this repository so you can read it on GitHub without downloading anything:
