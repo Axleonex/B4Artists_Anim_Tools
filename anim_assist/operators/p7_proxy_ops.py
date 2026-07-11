@@ -89,6 +89,7 @@ class AA_OT_p7_create_proxy(bpy.types.Operator):
 
     proxy_type: bpy.props.EnumProperty(  # type: ignore[valid-type]
         name="Proxy Type",
+        description="Type of temporary helper to create for the active object or bone",
         items=_proxy_type_items_fn,
         default=0,
     )

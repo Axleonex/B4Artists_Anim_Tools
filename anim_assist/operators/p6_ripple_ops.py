@@ -65,6 +65,7 @@ class AA_OT_p6_ripple_forward(bpy.types.Operator):
 
     ripple_delta: FloatProperty(  # type: ignore[valid-type]
         name="Ripple Amount",
+        description="Number of frames to shift keys after the playhead",
         default=1.0,
         soft_min=-500.0,
         soft_max=500.0,
@@ -113,6 +114,7 @@ class AA_OT_p6_ripple_backward(bpy.types.Operator):
 
     ripple_delta: FloatProperty(  # type: ignore[valid-type]
         name="Ripple Amount",
+        description="Number of frames to shift keys before the playhead",
         default=1.0,
         soft_min=0.0,
         soft_max=500.0,
@@ -164,6 +166,7 @@ class AA_OT_p6_insert_time(bpy.types.Operator):
 
     insert_frames: IntProperty(  # type: ignore[valid-type]
         name="Frames",
+        description="Number of blank frames to insert at the playhead",
         default=1,
         min=1,
         soft_max=500,
@@ -277,6 +280,7 @@ class AA_OT_p6_ripple_to_end(bpy.types.Operator):
 
     ripple_delta: FloatProperty(  # type: ignore[valid-type]
         name="Ripple Amount",
+        description="Number of frames to shift keys from the playhead to the end",
         default=1.0,
         soft_min=-500.0,
         soft_max=500.0,
@@ -342,6 +346,7 @@ class AA_OT_p6_compress_timing(bpy.types.Operator):
 
     target_duration: FloatProperty(  # type: ignore[valid-type]
         name="Target Duration (frames)",
+        description="Desired duration of the active range after compression",
         default=24.0,
         min=1.0,
         soft_max=5000.0,

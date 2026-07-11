@@ -130,7 +130,7 @@ class ANIMASSIST_PT_p12_lipsync_v3d(PanelAnatomyMixin, View3DSidebarPanel):
 
             box.prop(link, "audio_path", text="Audio")
             if link.audio_path and not au.is_supported_audio(link.audio_path):
-                box.label(text=".wav only in v12.0.0", icon="ERROR")
+                box.label(text="Choose a .wav audio file", icon="ERROR")
 
             # Audio-in-dope-sheet callout (mythologist dissent)
             if link.speaker_strip_name:

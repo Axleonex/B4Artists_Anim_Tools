@@ -38,10 +38,10 @@ class AA_AddonPreferences(bpy.types.AddonPreferences):
 
     # --- HELP SYSTEM INTEGRATION ---
     show_explainer_help: BoolProperty(  # type: ignore[valid-type]
-        name="Show Explainer Help",
+        name="Show Extended Help Popups",
         description=(
-            "Show inline question-mark icons next to Anim Assist controls "
-            "that open a popup with a long-form explanation"
+            "Show Anim Assist question-mark buttons that open detailed help popups; "
+            "native Bforartists hover tooltips are unaffected"
         ),
         default=True,
     )
@@ -94,15 +94,15 @@ class AA_AddonPreferences(bpy.types.AddonPreferences):
     )
 
     # Feature module toggles.
-    enable_selection: BoolProperty(name="Selection Tools", default=True)  # type: ignore[valid-type]
-    enable_keys: BoolProperty(name="Key Utilities", default=True)  # type: ignore[valid-type]
-    enable_transform: BoolProperty(name="Transform Workflows", default=True)  # type: ignore[valid-type]
-    enable_breakdown: BoolProperty(name="Breakdown Tools", default=True)  # type: ignore[valid-type]
-    enable_trajectory: BoolProperty(name="Trajectory Tools", default=True)  # type: ignore[valid-type]
-    enable_retime: BoolProperty(name="Retime Tools", default=True)  # type: ignore[valid-type]
-    enable_controls: BoolProperty(name="Temp Controls", default=True)  # type: ignore[valid-type]
-    enable_matching: BoolProperty(name="Matching Workflows", default=True)  # type: ignore[valid-type]
-    enable_layers: BoolProperty(name="Animation Layers", default=True)  # type: ignore[valid-type]
+    enable_selection: BoolProperty(name="Selection Tools", description="Enable keyframe and channel selection tools", default=True)  # type: ignore[valid-type]
+    enable_keys: BoolProperty(name="Key Utilities", description="Enable key editing and metadata utilities", default=True)  # type: ignore[valid-type]
+    enable_transform: BoolProperty(name="Transform Workflows", description="Enable transform and animation offset workflows", default=True)  # type: ignore[valid-type]
+    enable_breakdown: BoolProperty(name="Breakdown Tools", description="Enable breakdown, inbetween, and pose comparison tools", default=True)  # type: ignore[valid-type]
+    enable_trajectory: BoolProperty(name="Trajectory Tools", description="Enable trajectory overlays and arc diagnostics", default=True)  # type: ignore[valid-type]
+    enable_retime: BoolProperty(name="Retime Tools", description="Enable keyframe timing, ripple, and time-warp tools", default=True)  # type: ignore[valid-type]
+    enable_controls: BoolProperty(name="Temp Controls", description="Enable temporary proxy and rig control tools", default=True)  # type: ignore[valid-type]
+    enable_matching: BoolProperty(name="Matching Workflows", description="Enable transform matching and IK/FK switching tools", default=True)  # type: ignore[valid-type]
+    enable_layers: BoolProperty(name="Animation Layers", description="Enable the animation-layer workflow", default=True)  # type: ignore[valid-type]
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout

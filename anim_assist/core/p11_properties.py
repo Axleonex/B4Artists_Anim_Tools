@@ -446,6 +446,7 @@ class AA_P11_Properties(bpy.types.PropertyGroup):
 
     user_presets_index: IntProperty(  # type: ignore[valid-type]
         name="Active Preset",
+        description="Index of the selected animation-layer preset",
         default=0,
         min=0,
     )

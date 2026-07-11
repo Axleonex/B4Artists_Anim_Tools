@@ -48,7 +48,7 @@ def draw_help_browser(
         box.label(text="Preferences unavailable", icon="ERROR")
         return
 
-    title.prop(prefs, "show_explainer_help", text="Inline Help")
+    title.prop(prefs, "show_explainer_help", text="Extended Help")
     title.prop(prefs, "compact_ui_mode", text="Compact")
 
     groups = help_registry.get_help_by_category()

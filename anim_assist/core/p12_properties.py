@@ -151,6 +151,7 @@ class AA_P12_RigWiringEntry(bpy.types.PropertyGroup):
     )
     bone_name: StringProperty(  # type: ignore[valid-type]
         name="Bone",
+        description="Bone assigned to this logical facial role",
         default="",
     )
 
@@ -172,6 +173,7 @@ class AA_P12_LipsyncLayerLink(bpy.types.PropertyGroup):
     )
     audio_path: StringProperty(  # type: ignore[valid-type]
         name="Audio File",
+        description="WAV audio file used to generate this lipsync layer",
         subtype="FILE_PATH",
         default="",
     )
@@ -185,26 +187,31 @@ class AA_P12_LipsyncLayerLink(bpy.types.PropertyGroup):
     )
     viseme_library: EnumProperty(  # type: ignore[valid-type]
         name="Viseme Library",
+        description="Viseme naming and pose library used for speech shapes",
         items=_viseme_library_items,
         default=0,
     )
     backend: EnumProperty(  # type: ignore[valid-type]
         name="Backend",
+        description="Speech-analysis backend used to generate viseme cues",
         items=_backend_items,
         default=0,
     )
     setup_mode: EnumProperty(  # type: ignore[valid-type]
         name="Setup Mode",
+        description="Whether setup creates markers only or also performs the initial bake",
         items=_setup_mode_items,
         default=0,
     )
     frame_offset: IntProperty(  # type: ignore[valid-type]
         name="Frame Offset",
+        description="Shift generated lipsync cues by this many frames",
         default=1,
         min=0,
     )
     anticipation_frames: IntProperty(  # type: ignore[valid-type]
         name="Anticipation",
+        description="Move mouth-shape cues earlier by this many frames",
         default=2,
         min=0,
         max=12,
@@ -260,6 +267,7 @@ class AA_P12_Properties(bpy.types.PropertyGroup):
 
     enabled: BoolProperty(  # type: ignore[valid-type]
         name="Enable Lipsync",
+        description="Enable Anim Assist lipsync evaluation for this scene",
         default=True,
     )
     viseme_poses: CollectionProperty(  # type: ignore[valid-type]
@@ -286,15 +294,18 @@ class AA_P12_Properties(bpy.types.PropertyGroup):
     )
     show_manual_overrides: BoolProperty(  # type: ignore[valid-type]
         name="Highlight Manual Overrides",
+        description="Highlight keys protected from automatic lipsync rebaking",
         default=True,
     )
     rhubarb_path: StringProperty(  # type: ignore[valid-type]
         name="Rhubarb Path",
+        description="Path to the optional Rhubarb Lip Sync executable",
         subtype="FILE_PATH",
         default="",
     )
     amplitude_jaw_scale: FloatProperty(  # type: ignore[valid-type]
         name="Jaw Amplitude Scale",
+        description="Multiplier applied to generated jaw movement",
         default=1.0,
         min=0.0,
         max=10.0,

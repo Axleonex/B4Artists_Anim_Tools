@@ -14,10 +14,10 @@ unregister functions are called in the correct dependency order.
 bl_info = {
     "name": "Ghost Tool",
     "author": "GoingGhost",
-    "version": (3, 3, 0),
+    "version": (3, 3, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Ghost Tool",
-    "description": "Ghost keyframe visualization and manipulation for Bforartists. v3.3 adds Visual Diff Mode and Physics Feel archetypes.",
+    "description": "Ghost keyframe visualization and manipulation for Bforartists. v3.3.1 fixes clean add-on teardown and improves workflow clarity.",
     "category": "Animation",
     "doc_url": "",
     "tracker_url": "",
@@ -76,7 +76,7 @@ def _clear_pycache():
             utils.warn(f"Could not clear __pycache__: {exc}")
 
 
-def _import_modules():
+def _import_modules(*, reload_modules: bool = True):
     """Import all submodules.  Handles both first-load and reload scenarios."""
     global _modules_loaded
 
@@ -102,7 +102,7 @@ def _import_modules():
     from . import api
     from . import mesh_ghosts
 
-    if _modules_loaded:
+    if _modules_loaded and reload_modules:
         importlib.reload(utils)
         importlib.reload(ghost_data)
         importlib.reload(session_state)
@@ -210,9 +210,12 @@ def _unregister_supported() -> None:
     """Unregister the full Ghost Tool addon (Bforartists only)."""
     from . import utils
 
-    modules = _import_modules()
+    # Unregister the exact class objects registered above. Reloading here
+    # creates fresh classes without Blender RNA metadata and leaks the originals.
+    modules = _import_modules(reload_modules=False)
 
     utils.log("Unregistering addon...")
+    errors = []
 
     for module_name in reversed(_REGISTER_ORDER):
         module = modules.get(module_name)
@@ -221,6 +224,7 @@ def _unregister_supported() -> None:
                 module.unregister()
                 utils.log(f"  Unregistered: {module_name}")
             except Exception as exc:
+                errors.append(f"{module_name}: {exc}")
                 utils.warn(f"ERROR unregistering {module_name}: {exc}")
                 import traceback
                 traceback.print_exc()
@@ -242,6 +246,9 @@ def _unregister_supported() -> None:
         DiffReference.clear_all()
     except Exception as exc:
         utils.warn(f"Failed to clear DiffReference instances during unregister: {exc}")
+
+    if errors:
+        raise RuntimeError("Ghost Tool teardown failed: " + "; ".join(errors))
 
     utils.log("Addon unregistered.")
 

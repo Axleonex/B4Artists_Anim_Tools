@@ -34,6 +34,15 @@ class GhostToolPreferences(bpy.types.AddonPreferences):
 
     bl_idname = "ghost_tool"
 
+    show_extended_help: bpy.props.BoolProperty(
+        name="Show Extended Help Popups",
+        description=(
+            "Show Ghost Tool question-mark buttons that open detailed help popups; "
+            "native Bforartists hover tooltips are unaffected"
+        ),
+        default=True,
+    )  # type: ignore[assignment]
+
     # --- Ghost appearance ---
 
     ghost_radius: bpy.props.FloatProperty(
@@ -247,6 +256,10 @@ class GhostToolPreferences(bpy.types.AddonPreferences):
             context: The current Blender context.
         """
         layout = self.layout
+
+        help_box = layout.box()
+        help_box.label(text="Help", icon='QUESTION')
+        help_box.prop(self, "show_extended_help")
 
         # Ghost appearance section
         box = layout.box()

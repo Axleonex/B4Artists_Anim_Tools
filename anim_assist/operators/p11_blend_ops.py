@@ -234,6 +234,7 @@ class ANIMASSIST_OT_p11_set_blend_factor(bpy.types.Operator):
 
     factor: FloatProperty(  # type: ignore[valid-type]
         name="Factor",
+        description="Blend amount between the source and target animation layers",
         default=0.5, min=0.0, max=1.0,
         subtype="FACTOR",
     )
@@ -392,6 +393,7 @@ class ANIMASSIST_OT_p11_set_weight(bpy.types.Operator):
 
     weight: FloatProperty(  # type: ignore[valid-type]
         name="Weight",
+        description="Influence of the active animation layer",
         default=1.0, min=0.0, max=1.0,
         subtype="FACTOR",
     )
@@ -422,6 +424,7 @@ class ANIMASSIST_OT_p11_set_blend_mode(bpy.types.Operator):
 
     mode: EnumProperty(  # type: ignore[valid-type]
         name="Mode",
+        description="How the active animation layer combines with layers below it",
         items=[
             ("OVERRIDE", "Override", ""),
             ("ADDITIVE", "Additive", ""),

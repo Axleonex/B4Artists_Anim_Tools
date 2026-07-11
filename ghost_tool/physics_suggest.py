@@ -628,7 +628,6 @@ class GHOST_OT_archetype_bake(bpy.types.Operator):
         amplitude = settings.archetype_amplitude
         axis = settings.archetype_axis.lower()
         channel = f"location.{axis}"
-        collision_mode = settings.archetype_collision_mode
 
         # Resolve the fcurve for the target channel.
         # Bone support: use the active pose bone if one is selected.
@@ -648,10 +647,8 @@ class GHOST_OT_archetype_bake(bpy.types.Operator):
         # Push a single undo step before any writes — unconditional.
         bpy.ops.ed.undo_push(message=f"Archetype Bake: {archetype_name}")
 
-        # Collision policy: REPLACE clears existing keys on the channel first.
-        # OFFSET is stubbed; users see a clear label in the UI dropdown.
-        if collision_mode == "REPLACE":
-            self._clear_channel_keys(fcurve, start, end)
+        # Replace is the only supported collision policy; do it explicitly.
+        self._clear_channel_keys(fcurve, start, end)
 
         # Stamp one keyframe per frame across the bake range.
         total_frames = end - start

@@ -186,6 +186,13 @@ class AA_P10_Properties(PropertyGroup):  # type: ignore[valid-type]
     # Shelf Properties
     # ========================================================================
 
+    first_run_complete: BoolProperty(  # type: ignore[valid-type]
+        name="First Run Complete",
+        description="Whether the initial Anim Assist setup has completed",
+        default=False,
+        options={'HIDDEN'},
+    )
+
     shelf_mode: EnumProperty(  # type: ignore[valid-type]
         name="Shelf Mode",
         description="Display mode for the tool shelf",

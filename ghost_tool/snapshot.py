@@ -398,6 +398,7 @@ class GHOST_OT_toggle_snapshot(bpy.types.Operator):
 
     snapshot_uid: bpy.props.StringProperty(
         name="Snapshot UID",
+        description="Internal identifier of the snapshot whose visibility will change",
     )  # type: ignore[assignment]
 
     def execute(self, context: bpy.types.Context) -> set[str]:
@@ -423,6 +424,7 @@ class GHOST_OT_delete_snapshot(bpy.types.Operator):
 
     snapshot_uid: bpy.props.StringProperty(
         name="Snapshot UID",
+        description="Internal identifier of the snapshot to delete",
     )  # type: ignore[assignment]
 
     def execute(self, context: bpy.types.Context) -> set[str]:

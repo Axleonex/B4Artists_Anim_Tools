@@ -16,9 +16,11 @@ Design philosophy:
 
 from __future__ import annotations
 
+import textwrap
+
 import bpy
 
-from .ghost_data import GhostStore
+from .ghost_data import AnchorState, DiffReference, GhostStore
 from .snapshot import SnapshotStore
 from .easing_presets import PRESET_ENUM_ITEMS
 from .utils import log, warn, debug
@@ -37,7 +39,6 @@ class GhostToolEasingSettings(bpy.types.PropertyGroup):
         items=PRESET_ENUM_ITEMS,
         default="EASE_IN_OUT",
     )  # type: ignore[assignment]
-
     custom_left_x: bpy.props.FloatProperty(
         name="Left Handle X",
         description="Horizontal position of the left keyframe's outgoing handle (0 = at keyframe, 1 = at next keyframe)",
@@ -58,6 +59,126 @@ class GhostToolEasingSettings(bpy.types.PropertyGroup):
         description="Vertical position of the right keyframe's incoming handle (0 = flat, positive = overshoot)",
         default=0.0, min=-2.0, max=2.0,
     )  # type: ignore[assignment]
+
+
+_HELP_TOPICS = {
+    "overview": (
+        "Ghost Tool Workflow",
+        "Generate markers, drag them with Shift+G, then refine the resulting animation curves.",
+        "Enable Ghost Tools, choose the marker range and subdivision level, and generate markers. "
+        "Drag a marker to reshape motion, pin important markers, and use snapshots before larger edits.",
+    ),
+    "onion_skin": (
+        "Onion Skin",
+        "Show translucent mesh poses before and after the current frame.",
+        "Use onion skins to compare silhouette, spacing, and overlap. Reduce the range or opacity "
+        "when the viewport becomes crowded.",
+    ),
+    "motion_trails": (
+        "Motion Trails",
+        "Draw the path and timing spacing of animated motion through the viewport.",
+        "Arc lines reveal trajectory shape. Spacing ticks reveal acceleration: dense marks indicate "
+        "slower movement and wider gaps indicate faster movement.",
+    ),
+    "marker_placement": (
+        "Marker Placement",
+        "Choose which frames become editable ghost markers.",
+        "Set the frame range and subdivision level before generating. Higher subdivision produces "
+        "more editable inbetweens but also creates a denser viewport.",
+    ),
+    "marker_display": (
+        "Marker Display",
+        "Control marker colors, size, labels, arcs, and mesh visualization.",
+        "Display settings change only viewport presentation; they do not alter animation data. "
+        "Use simpler display modes when working with dense shots.",
+    ),
+    "marker_tools": (
+        "Marker Tools",
+        "Edit, select, pin, snapshot, ease, and apply physics-shaped motion.",
+        "Drag Marker is the main editing action. Choose what happens on confirmation, use falloff "
+        "to affect neighbors, and take a snapshot before stamping Physics Feel keys.",
+    ),
+    "export_import": (
+        "Export and Import",
+        "Save Ghost Tool marker and snapshot data or restore it later.",
+        "Export before transferring a setup or making destructive changes. Import replaces or "
+        "reconstructs tool state but does not replace a normal .blend backup.",
+    ),
+    "settings": (
+        "Ghost Tool Settings",
+        "Adjust interaction, performance, and viewport behavior for the current scene.",
+        "Keep marker counts and display complexity modest for heavy rigs. Add-on-wide visual "
+        "defaults and the extended-help switch live in the installed add-on preferences.",
+    ),
+    "snapshots": (
+        "Saved Snapshots",
+        "Capture restorable Ghost Tool states before experimenting.",
+        "Restore a snapshot to return to its captured curve state, toggle its overlay for comparison, "
+        "or delete snapshots that are no longer useful.",
+    ),
+}
+
+
+def _extended_help_enabled(context: bpy.types.Context) -> bool:
+    addons = getattr(getattr(context, "preferences", None), "addons", None)
+    addon = addons.get("ghost_tool") if addons is not None else None
+    prefs = getattr(addon, "preferences", None)
+    return bool(getattr(prefs, "show_extended_help", True))
+
+
+def _draw_help_icon(layout, context: bpy.types.Context, topic: str) -> None:
+    if not _extended_help_enabled(context):
+        return
+    operator = layout.operator(
+        "ghost_tool.show_help_popup",
+        text="",
+        icon='QUESTION',
+        emboss=False,
+    )
+    operator.topic = topic
+
+
+class GHOST_OT_show_help_popup(bpy.types.Operator):
+    """Display extended help for a Ghost Tool panel."""
+
+    bl_idname = "ghost_tool.show_help_popup"
+    bl_label = "Ghost Tool Help"
+    bl_description = "Show detailed help for this Ghost Tool section"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    topic: bpy.props.StringProperty(
+        name="Help Topic",
+        description="Internal identifier of the Ghost Tool help topic to display",
+        default="overview",
+    )  # type: ignore[assignment]
+
+    def invoke(self, context, event):
+        if self.topic not in _HELP_TOPICS:
+            self.report({'WARNING'}, "Help topic not found")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        title, summary, details = _HELP_TOPICS[self.topic]
+        layout = self.layout
+        header = layout.box()
+        header.label(text=title, icon='QUESTION')
+        for line in textwrap.wrap(summary, width=62):
+            header.label(text=line)
+        body = layout.box()
+        body.label(text="Details", icon='INFO')
+        for line in textwrap.wrap(details, width=62):
+            body.label(text=line)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class _GhostHelpPanelMixin:
+    help_topic = "overview"
+
+    def draw_header(self, context):
+        _draw_help_icon(self.layout, context, self.help_topic)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -89,6 +210,7 @@ class GHOST_PT_strip(bpy.types.Panel):
         if hasattr(scene, 'ghost_tool'):
             # Master toggle (GHOST_ENABLED icon shows system is active)
             layout.prop(scene.ghost_tool, "is_active", text="", icon='GHOST_ENABLED')
+        _draw_help_icon(layout, context, "overview")
 
     def draw(self, context: bpy.types.Context) -> None:
         """Draw the full ghost strip UI.
@@ -148,7 +270,10 @@ class GHOST_PT_strip(bpy.types.Panel):
         if not settings.is_active:
             return  # Everything hidden when tools are off
 
-        # Child panels handle the rest (collapsible sections)
+        layout.label(text="Generate -> Drag (Shift+G) -> Refine", icon='INFO')
+        status = layout.row(align=True)
+        status.label(text=f"{len(store)} markers", icon='GHOST_ENABLED')
+        status.label(text=f"{len(store.get_pinned())} pinned", icon='PINNED')
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +291,7 @@ def _ghost_active_poll(cls, context):
 # ║  CHILD PANEL 1 — ONION SKIN                                           ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_onion_skin(bpy.types.Panel):
+class GHOST_PT_onion_skin(_GhostHelpPanelMixin, bpy.types.Panel):
     """Onion Skin — transparent mesh pose silhouettes."""
 
     bl_idname = "GHOST_PT_onion_skin"
@@ -175,6 +300,7 @@ class GHOST_PT_onion_skin(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "onion_skin"
 
     @classmethod
     def poll(cls, context):
@@ -251,7 +377,7 @@ class GHOST_PT_onion_skin(bpy.types.Panel):
 # ║  CHILD PANEL 2 — MOTION TRAILS                                        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_motion_trails(bpy.types.Panel):
+class GHOST_PT_motion_trails(_GhostHelpPanelMixin, bpy.types.Panel):
     """Motion Trails — dots tracking bone paths through space."""
 
     bl_idname = "GHOST_PT_motion_trails"
@@ -260,6 +386,7 @@ class GHOST_PT_motion_trails(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "motion_trails"
 
     @classmethod
     def poll(cls, context):
@@ -298,7 +425,7 @@ class GHOST_PT_motion_trails(bpy.types.Panel):
 # ║  CHILD PANEL 3 — MARKER PLACEMENT                                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_marker_placement(bpy.types.Panel):
+class GHOST_PT_marker_placement(_GhostHelpPanelMixin, bpy.types.Panel):
     """Marker Placement — distribution mode and temporal range."""
 
     bl_idname = "GHOST_PT_marker_placement"
@@ -307,6 +434,7 @@ class GHOST_PT_marker_placement(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "marker_placement"
 
     @classmethod
     def poll(cls, context):
@@ -349,7 +477,7 @@ class GHOST_PT_marker_placement(bpy.types.Panel):
 # ║  CHILD PANEL 4 — MARKER DISPLAY  (collapsed by default)               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_marker_display(bpy.types.Panel):
+class GHOST_PT_marker_display(_GhostHelpPanelMixin, bpy.types.Panel):
     """Marker Display — colors, arcs, fading, visual styling."""
 
     bl_idname = "GHOST_PT_marker_display"
@@ -358,6 +486,7 @@ class GHOST_PT_marker_display(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "marker_display"
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -451,7 +580,7 @@ class GHOST_PT_marker_display(bpy.types.Panel):
 # ║  CHILD PANEL 5 — MARKER TOOLS                                         ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_marker_tools(bpy.types.Panel):
+class GHOST_PT_marker_tools(_GhostHelpPanelMixin, bpy.types.Panel):
     """Marker Tools — drag, select, easing, pin, snapshot, physics."""
 
     bl_idname = "GHOST_PT_marker_tools"
@@ -460,6 +589,7 @@ class GHOST_PT_marker_tools(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "marker_tools"
 
     @classmethod
     def poll(cls, context):
@@ -586,9 +716,6 @@ class GHOST_PT_marker_tools(bpy.types.Panel):
             frame_row.prop(settings, "archetype_start_frame", text="Start")
             frame_row.prop(settings, "archetype_end_frame", text="End")
 
-            # Collision policy (OFFSET is stubbed, shown greyed-out)
-            column.prop(settings, "archetype_collision_mode", text="On Existing Keys")
-
             # Stamp button — primary action
             stamp_row = column.row(align=True)
             stamp_row.scale_y = 1.3
@@ -620,7 +747,15 @@ class GHOST_PT_marker_tools(bpy.types.Panel):
 
         if settings.show_diff_overlay:
             diff_col = layout.column(align=True)
-            diff_col.label(text=f"Reference frame: {settings.diff_anchor_frame}")
+            diff_ref = DiffReference.get(scene)
+            if diff_ref is None:
+                diff_col.label(text="No reference pinned", icon='INFO')
+            else:
+                is_stale = diff_ref.state == AnchorState.STALE
+                diff_col.label(
+                    text=f"Frame {diff_ref.anchor_frame}: {'stale' if is_stale else 'live'}",
+                    icon='ERROR' if is_stale else 'CHECKMARK',
+                )
             diff_col.prop(settings, "diff_max_distance", text="Max Distance")
             color_row = diff_col.row(align=True)
             color_row.prop(settings, "diff_cool_color", text="")
@@ -631,7 +766,7 @@ class GHOST_PT_marker_tools(bpy.types.Panel):
 # ║  CHILD PANEL 6 — EXPORT / IMPORT                                      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_export_import(bpy.types.Panel):
+class GHOST_PT_export_import(_GhostHelpPanelMixin, bpy.types.Panel):
     """Export / Import — save and load ghost data."""
 
     bl_idname = "GHOST_PT_export_import"
@@ -640,6 +775,7 @@ class GHOST_PT_export_import(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "export_import"
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -657,7 +793,7 @@ class GHOST_PT_export_import(bpy.types.Panel):
 # ║  SECTION 2 — SETTINGS POPOVER  (detailed tuning, opened from strip)   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_settings(bpy.types.Panel):
+class GHOST_PT_settings(_GhostHelpPanelMixin, bpy.types.Panel):
     """Detailed settings panel — frame range, grab radius, custom easing.
 
     This sub-panel holds the "deep" controls that don't need to be
@@ -670,6 +806,7 @@ class GHOST_PT_settings(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "settings"
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -725,7 +862,7 @@ class GHOST_PT_settings(bpy.types.Panel):
 # ║  SECTION 3 — SNAPSHOT MANAGER  (sub-panel with list)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-class GHOST_PT_snapshot_manager(bpy.types.Panel):
+class GHOST_PT_snapshot_manager(_GhostHelpPanelMixin, bpy.types.Panel):
     """Snapshot management sub-panel — list, toggle, restore, delete."""
 
     bl_idname = "GHOST_PT_snapshot_manager"
@@ -734,6 +871,7 @@ class GHOST_PT_snapshot_manager(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Ghost Tool"
     bl_parent_id = "GHOST_PT_strip"
+    help_topic = "snapshots"
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -1005,6 +1143,7 @@ def _draw_viewport_header_extension(self, context: bpy.types.Context) -> None:
 
 CLASSES: tuple[type, ...] = (
     GhostToolEasingSettings,
+    GHOST_OT_show_help_popup,
     GHOST_PT_strip,
     GHOST_PT_onion_skin,
     GHOST_PT_motion_trails,

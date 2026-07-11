@@ -1266,24 +1266,6 @@ class GhostToolSceneSettings(bpy.types.PropertyGroup):
         min=1,
     )  # type: ignore[assignment]
 
-    archetype_collision_mode: bpy.props.EnumProperty(
-        name="Existing Keys",
-        description="What to do when a keyframe already exists on the target channel",
-        items=[
-            (
-                "REPLACE",
-                "Replace",
-                "Clear existing keys on the target channel before stamping",
-            ),
-            (
-                "OFFSET",
-                "Offset (coming soon)",
-                "Shift existing keys to make room — not yet implemented",
-            ),
-        ],
-        default="REPLACE",
-    )  # type: ignore[assignment]
-
     show_arc_lines: bpy.props.BoolProperty(
         name="Show Arc Lines",
         description="Draw continuous trajectory lines through ghost positions across the timeline",

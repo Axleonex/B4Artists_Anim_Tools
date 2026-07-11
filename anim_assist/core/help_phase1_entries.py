@@ -68,15 +68,15 @@ PHASE1_ENTRIES: tuple[HelpEntry, ...] = (
     ),
     HelpEntry(
         id="pref.show_explainer_help",
-        label="Show Explainer Help",
-        tooltip="Show inline help icons next to Anim Assist controls",
+        label="Show Extended Help Popups",
+        tooltip="Show question-mark buttons that open detailed Anim Assist help",
         description=(
             "When enabled, every Anim Assist control that has a registered "
             "help entry gains a small question-mark icon beside it. Clicking "
             "the icon opens a popup with a long-form explanation of the "
             "control.\n\n"
-            "Disable this to hide every explainer icon across the addon. The "
-            "Help Browser panel remains accessible from the preferences."
+            "Disable this to hide every explainer icon across the addon. Native "
+            "Bforartists hover tooltips and the Help Browser remain available."
         ),
         phase=_PHASE,
         category="General",
@@ -89,7 +89,7 @@ PHASE1_ENTRIES: tuple[HelpEntry, ...] = (
             "Compact UI Mode keeps explainer icons visible but hides their "
             "neighbouring text labels, so sidebar panels remain dense on "
             "small screens.\n\n"
-            "Has no effect when Show Explainer Help is disabled."
+            "Has no effect when Show Extended Help Popups is disabled."
         ),
         phase=_PHASE,
         category="General",

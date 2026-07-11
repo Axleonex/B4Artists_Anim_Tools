@@ -88,6 +88,7 @@ class AA_OT_p6_scale_keys(bpy.types.Operator):
 
     scale_factor: FloatProperty(  # type: ignore[valid-type]
         name="Scale Factor",
+        description="Timing multiplier applied around the chosen pivot",
         default=1.0,
         min=0.01,
         max=100.0,
@@ -156,6 +157,7 @@ class AA_OT_p6_offset_keys(bpy.types.Operator):
 
     offset_frames: FloatProperty(  # type: ignore[valid-type]
         name="Offset",
+        description="Number of frames to shift the affected keyframes",
         default=1.0,
         soft_min=-500.0,
         soft_max=500.0,
@@ -238,6 +240,7 @@ class AA_OT_p6_time_warp(bpy.types.Operator):
 
     warp_percent: FloatProperty(  # type: ignore[valid-type]
         name="Warp %",
+        description="Timing percentage where 100 percent leaves timing unchanged",
         default=100.0,
         min=1.0,
         max=10000.0,

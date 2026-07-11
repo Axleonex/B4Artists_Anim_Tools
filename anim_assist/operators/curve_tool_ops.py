@@ -64,9 +64,10 @@ def _write_values(fcurve, indices: list[int], values: list[float]) -> None:
 class ANIMASSIST_OT_blend_frame(Operator):
     bl_idname = "animassist.blend_frame"
     bl_label = "Blend Frame"
+    bl_description = "Blend selected keys toward the value at the reference frame"
     bl_options = {"REGISTER", "UNDO"}
 
-    factor: FloatProperty(name="Factor", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
+    factor: FloatProperty(name="Factor", description="Strength of the blend toward the reference-frame value", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -166,9 +167,10 @@ class ANIMASSIST_OT_blend_frame(Operator):
 class ANIMASSIST_OT_blend_offset(Operator):
     bl_idname = "animassist.blend_offset"
     bl_label = "Blend Offset"
+    bl_description = "Offset selected keys using the difference between their neighboring keys"
     bl_options = {"REGISTER", "UNDO"}
 
-    factor: FloatProperty(name="Factor", default=0.0, soft_min=-1.0, soft_max=1.0)  # type: ignore[assignment]
+    factor: FloatProperty(name="Factor", description="Signed strength of the neighboring-key offset", default=0.0, soft_min=-1.0, soft_max=1.0)  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -258,9 +260,10 @@ class ANIMASSIST_OT_blend_offset(Operator):
 class ANIMASSIST_OT_ease_to_ease(Operator):
     bl_idname = "animassist.ease_to_ease"
     bl_label = "Ease To Ease"
+    bl_description = "Blend selected keys from linear spacing toward a smooth ease-in/ease-out curve"
     bl_options = {"REGISTER", "UNDO"}
 
-    factor: FloatProperty(name="Factor", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
+    factor: FloatProperty(name="Factor", description="Strength of the ease-in/ease-out shaping", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -353,7 +356,7 @@ class ANIMASSIST_OT_blend_neighbor(Operator):
     bl_description = "Blend selected keys toward the line between their unselected neighbors"
     bl_options = {"REGISTER", "UNDO"}
 
-    factor: FloatProperty(name="Factor", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
+    factor: FloatProperty(name="Factor", description="Strength of the blend toward neighboring keys", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -452,7 +455,7 @@ class ANIMASSIST_OT_push_pull(Operator):
     bl_description = "Scale selected keys away from or toward the reference frame value"
     bl_options = {"REGISTER", "UNDO"}
 
-    factor: FloatProperty(name="Factor", default=0.0, soft_min=-1.0, soft_max=2.0)  # type: ignore[assignment]
+    factor: FloatProperty(name="Factor", description="Amount to push away from or pull toward the reference value", default=0.0, soft_min=-1.0, soft_max=2.0)  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -555,7 +558,7 @@ class ANIMASSIST_OT_smooth_keys(Operator):
     bl_description = "Blend selected keys toward the average of their immediate neighbors"
     bl_options = {"REGISTER", "UNDO"}
 
-    factor: FloatProperty(name="Factor", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
+    factor: FloatProperty(name="Factor", description="Strength of smoothing toward neighboring-key averages", default=0.0, soft_min=0.0, soft_max=1.0)  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -651,6 +654,7 @@ class ANIMASSIST_OT_smooth_keys(Operator):
 class ANIMASSIST_OT_set_reference_frame(Operator):
     bl_idname = "animassist.set_reference_frame"
     bl_label = "Set Reference Frame"
+    bl_description = "Use the current playhead frame as the reference for blend tools"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context: bpy.types.Context):
@@ -664,9 +668,10 @@ class ANIMASSIST_OT_set_reference_frame(Operator):
 class ANIMASSIST_OT_add_bookmark(Operator):
     bl_idname = "animassist.add_bookmark"
     bl_label = "Add Frame Bookmark"
+    bl_description = "Save the current reference frame as a named bookmark"
     bl_options = {"REGISTER", "UNDO"}
 
-    name: StringProperty(name="Name", default="Bookmark")  # type: ignore[assignment]
+    name: StringProperty(name="Name", description="Display name for the new frame bookmark", default="Bookmark")  # type: ignore[assignment]
 
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event):
         # ACCESS_GATE_HERE
@@ -685,6 +690,7 @@ class ANIMASSIST_OT_add_bookmark(Operator):
 class ANIMASSIST_OT_remove_bookmark(Operator):
     bl_idname = "animassist.remove_bookmark"
     bl_label = "Remove Frame Bookmark"
+    bl_description = "Delete the active frame bookmark"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context: bpy.types.Context):
@@ -700,9 +706,10 @@ class ANIMASSIST_OT_remove_bookmark(Operator):
 class ANIMASSIST_OT_recall_bookmark(Operator):
     bl_idname = "animassist.recall_bookmark"
     bl_label = "Recall Bookmark"
+    bl_description = "Set the reference frame from a saved bookmark"
     bl_options = {"REGISTER", "UNDO"}
 
-    index: IntProperty(name="Index", default=0)  # type: ignore[assignment]
+    index: IntProperty(name="Index", description="Stored bookmark index to recall", default=0)  # type: ignore[assignment]
 
     def execute(self, context: bpy.types.Context):
         # ACCESS_GATE_HERE

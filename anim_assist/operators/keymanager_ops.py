@@ -86,10 +86,12 @@ class ANIMASSIST_OT_batch_interpolation(Operator):
 class ANIMASSIST_OT_select_handles(Operator):
     bl_idname = "animassist.select_handles"
     bl_label = "Select Handles"
+    bl_description = "Select the left, right, or both handles of selected keyframes"
     bl_options = {"REGISTER", "UNDO"}
 
     side: EnumProperty(  # type: ignore[assignment]
         name="Side",
+        description="Which handles to select on each selected keyframe",
         items=[
             ("LEFT", "Left", "Select left handles"),
             ("RIGHT", "Right", "Select right handles"),
@@ -131,9 +133,10 @@ class ANIMASSIST_OT_select_handles(Operator):
 class ANIMASSIST_OT_set_key_type(Operator):
     bl_idname = "animassist.set_key_type"
     bl_label = "Set Key Type"
+    bl_description = "Assign the chosen semantic key type to selected keyframes"
     bl_options = {"REGISTER", "UNDO"}
 
-    key_type: EnumProperty(name="Key Type", items=_KEY_TYPE_ITEMS, default="KEYFRAME")  # type: ignore[assignment]
+    key_type: EnumProperty(name="Key Type", description="Semantic type to assign to selected keys", items=_KEY_TYPE_ITEMS, default="KEYFRAME")  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -154,9 +157,10 @@ class ANIMASSIST_OT_set_key_type(Operator):
 class ANIMASSIST_OT_set_handle_type(Operator):
     bl_idname = "animassist.set_handle_type"
     bl_label = "Set Handle Type"
+    bl_description = "Set both Bezier handle types on selected keyframes"
     bl_options = {"REGISTER", "UNDO"}
 
-    handle_type: EnumProperty(name="Handle Type", items=_HANDLE_TYPE_ITEMS, default="AUTO_CLAMPED")  # type: ignore[assignment]
+    handle_type: EnumProperty(name="Handle Type", description="Bezier handle behavior to apply to selected keys", items=_HANDLE_TYPE_ITEMS, default="AUTO_CLAMPED")  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -179,10 +183,11 @@ class ANIMASSIST_OT_set_handle_type(Operator):
 class ANIMASSIST_OT_select_by_key_type(Operator):
     bl_idname = "animassist.select_by_key_type"
     bl_label = "Select by Key Type"
+    bl_description = "Select or deselect every keyframe of the chosen semantic type"
     bl_options = {"REGISTER", "UNDO"}
 
-    key_type: EnumProperty(name="Key Type", items=_KEY_TYPE_ITEMS, default="BREAKDOWN")  # type: ignore[assignment]
-    deselect: BoolProperty(name="Deselect", default=False)  # type: ignore[assignment]
+    key_type: EnumProperty(name="Key Type", description="Semantic key type to find", items=_KEY_TYPE_ITEMS, default="BREAKDOWN")  # type: ignore[assignment]
+    deselect: BoolProperty(name="Deselect", description="Deselect matching keys instead of selecting them", default=False)  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -207,9 +212,10 @@ class ANIMASSIST_OT_select_by_key_type(Operator):
 class ANIMASSIST_OT_delete_by_key_type(Operator):
     bl_idname = "animassist.delete_by_key_type"
     bl_label = "Delete by Key Type"
+    bl_description = "Delete every keyframe of the chosen semantic type"
     bl_options = {"REGISTER", "UNDO"}
 
-    key_type: EnumProperty(name="Key Type", items=_KEY_TYPE_ITEMS, default="JITTER")  # type: ignore[assignment]
+    key_type: EnumProperty(name="Key Type", description="Semantic key type to delete", items=_KEY_TYPE_ITEMS, default="JITTER")  # type: ignore[assignment]
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -233,11 +239,13 @@ class ANIMASSIST_OT_delete_by_key_type(Operator):
 class ANIMASSIST_OT_insert_frames(Operator):
     bl_idname = "animassist.insert_frames"
     bl_label = "Insert Frames"
+    bl_description = "Make room in the animation by shifting later keyframes forward"
     bl_options = {"REGISTER", "UNDO"}
 
-    count: IntProperty(name="Frame Count", default=1, min=1, soft_max=100)  # type: ignore[assignment]
+    count: IntProperty(name="Frame Count", description="Number of frames to insert", default=1, min=1, soft_max=100)  # type: ignore[assignment]
     mode: EnumProperty(  # type: ignore[assignment]
         name="Insert Mode",
+        description="Where the inserted time begins",
         items=[
             ("AT_CURSOR", "At Cursor", "Insert at current frame"),
             ("BETWEEN_SELECTED", "Between Selected", "Insert after first selected key"),

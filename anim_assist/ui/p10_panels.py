@@ -55,6 +55,15 @@ class ANIMASSIST_PT_p10_shelf(PanelAnatomyMixin, DopeSheetSidebarPanel):
             layout.label(text="Orchestration tools not available", icon="INFO")
             return
 
+        if not p10.first_run_complete:
+            start = layout.box()
+            start.label(text="New here? Start with sensible defaults.", icon="INFO")
+            start.operator(
+                "animassist.p10_first_run_setup",
+                text="First Run Setup",
+                icon="SETTINGS",
+            )
+
         # ── Shelf header and controls ──
         uh.section_header(layout, "Quick Shelf", icon="ASSET_MANAGER")
 

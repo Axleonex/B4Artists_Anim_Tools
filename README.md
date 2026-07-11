@@ -4,8 +4,8 @@ Two animation add-ons for **Bforartists** (the Blender fork). Both are **Bforart
 
 | Tool | Version | What it does |
 |---|---|---|
-| **Anim Assist** | 12.0.1 | A production animation workflow suite (~400 operators across 11 feature phases): key editing, breakdowns, trajectory polish, retiming, proxies, IK/FK matching, mirroring, animation layers, and a hybrid PREVIEW/SHIPPED lipsync system. Inspired by Maya's AnimBot. |
-| **Ghost Tool** | 3.3.0 | Ghost keyframe visualization and manipulation: generates draggable in-between markers in 3D space and recalculates f-curves live. Includes onion skinning, motion trails, easing presets, snapshots, Physics Feel archetypes, and Visual Diff Mode. |
+| **Anim Assist** | 12.0.2 | A production animation workflow suite (~400 operators across 11 feature phases): key editing, breakdowns, trajectory polish, retiming, proxies, IK/FK matching, mirroring, animation layers, and a hybrid PREVIEW/SHIPPED lipsync system. Inspired by Maya's AnimBot. |
+| **Ghost Tool** | 3.3.1 | Ghost keyframe visualization and manipulation: generates draggable in-between markers in 3D space and recalculates f-curves live. Includes onion skinning, motion trails, easing presets, snapshots, Physics Feel archetypes, and Visual Diff Mode. |
 
 > These tools were built with heavy AI assistance and are under active bug-fixing. If you hit an issue, a screenshot or a note about what you were doing helps a lot — please open an [issue](../../issues).
 
@@ -13,8 +13,8 @@ Two animation add-ons for **Bforartists** (the Blender fork). Both are **Bforart
 
 The ready-to-install add-ons live in [`releases/`](releases/):
 
-- `b4_anim_assist_v12.0.1_low_jitter.zip`
-- `b4_ghost_tool_v7.zip`
+- `b4_anim_assist_v12.0.2.zip`
+- `b4_ghost_tool_v3.3.1.zip`
 
 To install in Bforartists:
 
@@ -24,6 +24,12 @@ To install in Bforartists:
 4. Open the **N-panel** in the 3D Viewport — Anim Assist adds tabs (Keys, Pose, Motion, Rig, Workspace, Layers, Lipsync); Ghost Tool adds a **Ghost Tool** tab.
 
 You don't need to unzip anything by hand — Bforartists installs directly from the `.zip`.
+
+### Extended help
+
+Each add-on has a **Show Extended Help Popups** switch in its installed add-on
+settings. Turning it off hides only that add-on's `?` buttons and detailed
+popups. Native Bforartists hover tooltips remain enabled.
 
 ## Browse the source
 

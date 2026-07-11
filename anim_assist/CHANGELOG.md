@@ -12,6 +12,14 @@ Each release updates four places in lockstep: `bl_info` in `__init__.py`,
 `ADDON_VERSION` and `ADDON_VERSION_STRING` in `constants.py`, and `version`
 in `blender_manifest.toml`.
 
+## v12.0.2 - Onboarding Reliability
+
+Patch: fixes First Run Setup under Blender's string-based enum API, surfaces
+the setup action when the shelf is empty, and makes the invalid-audio prompt
+version-independent. Completes native hover descriptions for all exposed
+operators, buttons, toggles, and directly drawn properties. Extended `?` help
+popups can be hidden independently from native Bforartists hover tooltips.
+
 ## v12.0.1 - Low-Jitter Trajectory Overlay Defaults
 
 Patch: makes the ghost/trajectory overlay safer to leave on while animating.

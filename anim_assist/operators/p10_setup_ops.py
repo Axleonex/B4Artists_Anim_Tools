@@ -129,7 +129,8 @@ class AA_OT_p10_first_run_setup(Operator):
             p10.recovery_enabled = True
             p10.max_recents = 20
             p10.audit_enabled = True
-            p10.shelf_mode = 0  # COMPACT
+            p10.shelf_mode = "COMPACT"
+            p10.first_run_complete = True
 
             _log.info("First run setup completed with defaults: recovery_enabled=True, max_recents=20, audit_enabled=True, shelf_mode=COMPACT")
 

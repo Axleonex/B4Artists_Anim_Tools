@@ -43,7 +43,7 @@ class AA_BoneMetadataItem(bpy.types.PropertyGroup):
     """One record of tool metadata keyed by object + bone name."""
 
     object_name: StringProperty(name="Object", default="")  # type: ignore[valid-type]
-    bone_name: StringProperty(name="Bone", default="")  # type: ignore[valid-type]
+    bone_name: StringProperty(name="Bone", description="Bone associated with this metadata record", default="")  # type: ignore[valid-type]
     metadata_json: StringProperty(name="Data", default="{}")  # type: ignore[valid-type]
 
 
@@ -58,7 +58,7 @@ class AA_ObjectMetadata(bpy.types.PropertyGroup):
 class AA_BookmarkItem(bpy.types.PropertyGroup):
     """A named frame bookmark stored on the scene."""
 
-    name: StringProperty(name="Name", default="Bookmark")  # type: ignore[valid-type]
+    name: StringProperty(name="Name", description="Display name of the frame bookmark", default="Bookmark")  # type: ignore[valid-type]
     frame: IntProperty(name="Frame", default=1)  # type: ignore[valid-type]
 
 
@@ -83,9 +83,9 @@ class AA_KeyMetaItem(bpy.types.PropertyGroup):
 class AA_MaskSettings(bpy.types.PropertyGroup):
     """Anim Offset mask / blend region settings."""
 
-    enabled: BoolProperty(name="Use Mask", default=True)  # type: ignore[valid-type]
-    start_frame: IntProperty(name="Start", default=1)  # type: ignore[valid-type]
-    end_frame: IntProperty(name="End", default=250)  # type: ignore[valid-type]
+    enabled: BoolProperty(name="Use Mask", description="Limit Anim Offset propagation to the masked frame range", default=True)  # type: ignore[valid-type]
+    start_frame: IntProperty(name="Start", description="First frame of the Anim Offset mask", default=1)  # type: ignore[valid-type]
+    end_frame: IntProperty(name="End", description="Last frame of the Anim Offset mask", default=250)  # type: ignore[valid-type]
     blend_left: IntProperty(  # type: ignore[valid-type]
         name="Blend In",
         description="Blend-in frames on the left edge of the mask",

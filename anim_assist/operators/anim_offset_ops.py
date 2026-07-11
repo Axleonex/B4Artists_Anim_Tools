@@ -60,6 +60,7 @@ def _has_key_at_frame(fc, frame: float) -> bool:
 class ANIMASSIST_OT_anim_offset(Operator):
     bl_idname = "animassist.anim_offset"
     bl_label = "Anim Offset"
+    bl_description = "Toggle Anim Offset mode and propagate current-frame edits across keyed animation"
     bl_options = {"REGISTER"}
 
     @classmethod
@@ -221,10 +222,11 @@ class ANIMASSIST_OT_anim_offset(Operator):
 class ANIMASSIST_OT_anim_offset_set_range(Operator):
     bl_idname = "animassist.anim_offset_set_range"
     bl_label = "Set Offset Range"
+    bl_description = "Set the start and end frames of the Anim Offset mask"
     bl_options = {"REGISTER", "UNDO"}
 
-    start: FloatProperty(name="Start", default=1.0)  # type: ignore[assignment]
-    end: FloatProperty(name="End", default=250.0)  # type: ignore[assignment]
+    start: FloatProperty(name="Start", description="First frame of the offset mask", default=1.0)  # type: ignore[assignment]
+    end: FloatProperty(name="End", description="Last frame of the offset mask", default=250.0)  # type: ignore[assignment]
 
     def execute(self, context: bpy.types.Context):
         # ACCESS_GATE_HERE
@@ -237,6 +239,7 @@ class ANIMASSIST_OT_anim_offset_set_range(Operator):
 class ANIMASSIST_OT_anim_offset_range_from_scene(Operator):
     bl_idname = "animassist.anim_offset_range_from_scene"
     bl_label = "Range from Scene"
+    bl_description = "Copy the scene frame range into the Anim Offset mask"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context: bpy.types.Context):
@@ -251,6 +254,7 @@ class ANIMASSIST_OT_anim_offset_range_from_scene(Operator):
 class ANIMASSIST_OT_anim_offset_toggle_mask(Operator):
     bl_idname = "animassist.anim_offset_toggle_mask"
     bl_label = "Toggle Mask"
+    bl_description = "Enable or disable the Anim Offset frame mask"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context: bpy.types.Context):
