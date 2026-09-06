@@ -510,11 +510,26 @@ class GhostDragOperator(bpy.types.Operator):
         session.select_only(ghost.uid)
 
         context.window_manager.modal_handler_add(self)
+        self._drag_session = session
+        session.drag_active = True
         tag_viewport_redraw(context)
 
         return {'RUNNING_MODAL'}
 
-    def modal(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+    def modal(self, context, event):
+        try:
+            return self._modal_inner(context, event)
+        except Exception as exc:
+            try:
+                self._cancel_drag(context)
+            except Exception as rollback_error:
+                warn(f"Drag rollback could not finish: {rollback_error}")
+            finally:
+                self._cleanup()
+            self.report({'ERROR'}, f"Ghost drag cancelled after an error: {exc}")
+            return {'CANCELLED'}
+
+    def _modal_inner(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
         """Handle events during the modal drag loop.
 
         Args:
@@ -526,6 +541,7 @@ class GhostDragOperator(bpy.types.Operator):
         """
         ghost = self._active_ghost
         if ghost is None:
+            self._cleanup()
             return {'CANCELLED'}
 
         # Validate parent object still exists (user may delete during drag)
@@ -921,6 +937,12 @@ class GhostDragOperator(bpy.types.Operator):
             ghost.world_position = self._original_position.copy()
             ghost.local_value = self._original_local_value
 
+        for neighbor, original_value, _weight in self._falloff_neighbors:
+            neighbor.local_value = original_value
+        for other, original_value, original_position in self._multi_drag_ghosts:
+            other.local_value = original_value
+            other.world_position = original_position.copy()
+
         # Clear selection via SessionState
         session = SessionState.get(context.scene)
         session.clear_selection()
@@ -953,6 +975,10 @@ class GhostDragOperator(bpy.types.Operator):
 
     def _cleanup(self) -> None:
         """Reset internal state after drag completion or cancellation."""
+        session = getattr(self, "_drag_session", None)
+        if session is not None:
+            session.drag_active = False
+            self._drag_session = None
         self._active_ghost = None
         self._original_position = None
         self._original_local_value = 0.0

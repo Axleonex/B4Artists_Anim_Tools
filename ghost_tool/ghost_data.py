@@ -22,6 +22,7 @@ and are persisted across sessions through JSON export/import.
 from __future__ import annotations
 
 import enum
+import math
 import hashlib
 import uuid
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ from typing import ClassVar, Optional
 import bpy
 from mathutils import Vector
 
-from .utils import warn, debug, find_fcurve_in_action, get_scene_id, tag_viewport_redraw
+from .utils import sampling_operation, warn, debug, find_fcurve_in_action, get_scene_id, tag_viewport_redraw
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -89,7 +90,7 @@ class DiffReference:
 
     anchor_frame: int
     anchor_hash: str
-    ghost_positions: dict[str, Vector]
+    ghost_positions: dict[tuple[str, str], Vector]
     state: AnchorState = AnchorState.LIVE
 
     # ------------------------------------------------------------------
@@ -139,27 +140,15 @@ def compute_anchor_hash(
     if not obj or not obj.animation_data or not obj.animation_data.action:
         return ""
 
-    action = obj.animation_data.action
-    parts: list[str] = []
-
-    try:
-        fcurves = list(action.fcurves)
-    except Exception as exc:
-        debug(f"compute_anchor_hash: failed to iterate fcurves: {exc}")
-        return ""
-
-    for fc in fcurves:
-        for kp in fc.keyframe_points:
-            if int(round(kp.co[0])) == frame:
-                parts.append(
-                    f"{fc.data_path}|{fc.array_index}|{kp.co[0]:.4f}|{kp.co[1]:.6f}"
-                )
-
-    if not parts:
-        return f"empty@{frame}"
-
-    digest = hashlib.sha256("|".join(sorted(parts)).encode()).hexdigest()[:16]
-    return digest
+    from .utils import get_fcurves_from_action
+    parts = []
+    for curve in get_fcurves_from_action(obj.animation_data.action, obj):
+        # Evaluate at the anchor; neighboring keys/handles affect between-key poses.
+        keys = tuple((tuple(k.co), tuple(k.handle_left), tuple(k.handle_right),
+                      k.interpolation, k.handle_left_type, k.handle_right_type)
+                     for k in curve.keyframe_points)
+        parts.append(repr((curve.data_path, curve.array_index, curve.evaluate(frame), keys)))
+    return hashlib.sha256(repr(sorted(parts)).encode()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +225,27 @@ class Ghost:
         Note:
             If 'uid' is missing from data, a new unique ID is generated.
         """
+        if not isinstance(data, dict):
+            raise ValueError("Ghost must be an object")
+        for key in ('frame', 'local_value', 'parent_frame_a', 'parent_frame_b'):
+            value = data.get(key, 0.0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{key} must be a finite number")
+        position = data.get('world_position', (0, 0, 0))
+        if not isinstance(position, (list, tuple)) or len(position) != 3 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in position):
+            raise ValueError("world_position must contain three finite numbers")
+        for key in ('uid', 'object_name', 'bone_name', 'channel'):
+            if key in data and not isinstance(data[key], str):
+                raise ValueError(f"{key} must be text")
+        if 'uid' in data and not data['uid']:
+            raise ValueError("uid must not be empty")
+        level = data.get('generation_level', 1)
+        if type(level) is not int or not 0 <= level <= MAX_SUBDIVISION_LEVEL + 1:
+            raise ValueError("Invalid generation level")
+        for key in ('is_pinned', 'is_selected'):
+            if key in data and type(data[key]) is not bool:
+                raise ValueError(f"{key} must be boolean")
         return cls(
             frame=data["frame"],
             world_position=Vector(data.get("world_position", (0.0, 0.0, 0.0))),
@@ -457,6 +467,8 @@ class GhostStore:
             self._index.pop(g.uid, None)
         self._ghosts = [g for g in self._ghosts if g.generation_level != level]
         self._update_level_counts()
+        if to_remove:
+            self._bump_version()
         return len(to_remove)
 
     # --- Query / filter operations ---
@@ -540,12 +552,16 @@ class GhostStore:
         """
         return [g for g in self._ghosts if g.object_name == object_name]
 
-    def get_selected(self) -> list[Ghost]:
+    def get_selected(self, scene=None) -> list[Ghost]:
         """Return all currently selected ghosts.
 
         Returns:
             list[Ghost]: Ghosts with is_selected == True.
         """
+        if scene is not None:
+            from .session_state import SessionState
+            selected = SessionState.get(scene).selection_set
+            return [g for g in self._ghosts if g.uid in selected]
         return [g for g in self._ghosts if g.is_selected]
 
     def get_pinned(self) -> list[Ghost]:
@@ -824,14 +840,14 @@ class GhostToolSceneSettings(bpy.types.PropertyGroup):
         name="Range Start",
         description="Start frame for ghost generation",
         default=1,
-        update=lambda self, context: _update_custom_range_start(self, context),
+        update=_update_custom_range_start,
     )  # type: ignore[assignment]
 
     custom_range_end: bpy.props.IntProperty(
         name="Range End",
         description="End frame for ghost generation",
         default=250,
-        update=lambda self, context: _update_custom_range_end(self, context),
+        update=_update_custom_range_end,
     )  # type: ignore[assignment]
 
     # ── Mesh Onion Skinning ──────────────────────────────────────────────
@@ -1581,6 +1597,8 @@ def _get_fcurve_for_channel(
     if len(parts) == 2:
         prop_name = parts[0]
         axis = parts[1].lower()
+        if prop_name == "rotation_quaternion":
+            axis_map = {"w": 0, "x": 1, "y": 2, "z": 3}
         array_index = axis_map.get(axis, 0)
     else:
         prop_name = channel
@@ -1588,7 +1606,7 @@ def _get_fcurve_for_channel(
 
     # Build the full data path
     if bone_name:
-        data_path = f'pose.bones["{bone_name}"].{prop_name}'
+        data_path = f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].{prop_name}'
     else:
         data_path = prop_name
 
@@ -1660,24 +1678,28 @@ def _get_world_position_cached(
     if cache_key in cache:
         return cache[cache_key].copy()
 
-    # Set the frame and update the dependency graph
-    scene.frame_set(int(frame), subframe=frame - int(frame))
-    depsgraph.update()
-
-    if bone_name and obj.type == 'ARMATURE':
-        pose_bone = obj.pose.bones.get(bone_name)
-        if pose_bone:
-            # World-space position of the bone head
-            world_pos = obj.matrix_world @ pose_bone.head.copy()
+    # Evaluate every requested bone at once. The cache lasts for this pass only.
+    # frame_set synchronously evaluates the dependency graph.
+    whole_frame = math.floor(frame)
+    scene.frame_set(whole_frame, subframe=frame - whole_frame)
+    evaluated = obj.evaluated_get(depsgraph)
+    for name in getattr(cache, 'bone_names', (bone_name,)):
+        pose_bone = evaluated.pose.bones.get(name) if name and evaluated.type == 'ARMATURE' else None
+        if pose_bone is not None:
+            position = evaluated.matrix_world @ pose_bone.head
         else:
-            from .utils import warn
-            warn(f"Bone '{bone_name}' not found on '{obj.name}'")
-            world_pos = obj.matrix_world.translation.copy()
-    else:
-        world_pos = obj.matrix_world.translation.copy()
+            if name:
+                warn(f"Bone '{name}' not found on '{obj.name}'")
+            position = evaluated.matrix_world.translation
+        cache[(obj.name, name, frame)] = position.copy()
+    return cache[cache_key].copy()
 
-    cache[cache_key] = world_pos.copy()
-    return world_pos.copy()
+
+class _WorldPositionCache(dict):
+    """One frame evaluation supplies positions for every requested bone."""
+    def __init__(self, bones):
+        super().__init__()
+        self.bone_names = tuple(dict.fromkeys(bones or ['']))
 
 
 def _find_surrounding_keyframes(
@@ -1821,6 +1843,7 @@ def _resolve_animation_target(
     return (target_obj, action)
 
 
+@sampling_operation
 def generate_ghosts(
     obj: bpy.types.Object,
     armature: Optional[bpy.types.Object],
@@ -1867,11 +1890,8 @@ def generate_ghosts(
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
 
-    # Save the current frame so we can restore it after sampling
-    original_frame = scene.frame_current
-
     # Position cache to minimize redundant frame_set calls
-    position_cache: dict[tuple[str, str, float], Vector] = {}
+    position_cache = _WorldPositionCache(bones)
 
     all_ghosts: list[Ghost] = []
 
@@ -1916,12 +1936,10 @@ def generate_ghosts(
                     results=all_ghosts,
                 )
 
-    # Restore the original frame to avoid disrupting the user's timeline position
-    scene.frame_set(original_frame)
-
     return all_ghosts
 
 
+@sampling_operation
 def generate_ghosts_frame_step(
     obj: bpy.types.Object,
     armature: Optional[bpy.types.Object],
@@ -1951,8 +1969,7 @@ def generate_ghosts_frame_step(
 
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    original_frame = scene.frame_current
-    position_cache: dict[tuple[str, str, float], Vector] = {}
+    position_cache = _WorldPositionCache(bones)
     all_ghosts: list[Ghost] = []
 
     bone_list = bones if bones else [""]
@@ -1991,10 +2008,10 @@ def generate_ghosts_frame_step(
                 )
                 all_ghosts.append(ghost)
 
-    scene.frame_set(original_frame)
     return all_ghosts
 
 
+@sampling_operation
 def generate_ghosts_at_keyframes(
     obj: bpy.types.Object,
     armature: Optional[bpy.types.Object],
@@ -2023,8 +2040,7 @@ def generate_ghosts_at_keyframes(
 
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    original_frame = scene.frame_current
-    position_cache: dict[tuple[str, str, float], Vector] = {}
+    position_cache = _WorldPositionCache(bones)
     all_ghosts: list[Ghost] = []
 
     bone_list = bones if bones else [""]
@@ -2059,7 +2075,6 @@ def generate_ghosts_at_keyframes(
                 )
                 all_ghosts.append(ghost)
 
-    scene.frame_set(original_frame)
     return all_ghosts
 
 

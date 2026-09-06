@@ -173,19 +173,18 @@ def set_ghost_position(
         warn(f"Ghost '{uid}' not found")
         return False
 
-    ghost.local_value = new_value
-
     if recalculate:
-        obj = bpy.data.objects.get(ghost.object_name)
-        if obj:
-            # Resolve f-curve for this ghost's channel (e.g., "location.x")
-            fcurve = fcurve_utils.resolve_fcurve(obj, ghost.bone_name, ghost.channel)
-            if fcurve:
-                settings = scene.ghost_tool
-                # Curve mode: FREE (independent handles), LOCKED (preserve angle), SMOOTH (even distribution)
-                mode = settings.curve_mode
-                mode = mode.lower()
-                fcurve_utils.recalculate_handles(fcurve, ghost.frame, new_value, mode=mode)
+        obj = scene.objects.get(ghost.object_name)
+        curve = fcurve_utils.resolve_fcurve(obj, ghost.bone_name, ghost.channel)
+        if curve is None:
+            return False
+        backup = fcurve_utils.snapshot_fcurve(curve)
+        if not fcurve_utils.recalculate_handles(curve, ghost.frame, new_value, mode=scene.ghost_tool.curve_mode.lower()):
+            fcurve_utils.restore_fcurve(curve, backup)
+            return False
+        refresh_ghosts(ghost.object_name)
+    else:
+        ghost.local_value = new_value
 
     # Fire callbacks
     _fire_ghost_moved(uid)
@@ -216,31 +215,40 @@ def refresh_ghosts(object_name: Optional[str] = None) -> int:
     scene = bpy.context.scene
     store = GhostStore.get(scene)
 
-    updated = 0
+    from .ghost_data import _WorldPositionCache, _get_world_position_cached
+    from .utils import scene_sampling
+    targets = {}
     for ghost in store:
-        if object_name and ghost.object_name != object_name:
-            continue
+        if not object_name or ghost.object_name == object_name:
+            targets.setdefault(ghost.object_name, []).append(ghost.bone_name)
+    positions = {name: _WorldPositionCache(bones) for name, bones in targets.items()}
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    with scene_sampling(scene):
+        updated = 0
+        for ghost in store:
+            if object_name and ghost.object_name != object_name:
+                continue
 
-        obj = bpy.data.objects.get(ghost.object_name)
-        if not obj:
-            continue
+            obj = bpy.data.objects.get(ghost.object_name)
+            if not obj:
+                continue
 
-        # Resolve f-curve for this ghost's channel (e.g., "location.x")
-        fcurve = fcurve_utils.resolve_fcurve(obj, ghost.bone_name, ghost.channel)
-        if fcurve is None:
-            continue
+            # Resolve f-curve for this ghost's channel (e.g., "location.x")
+            fcurve = fcurve_utils.resolve_fcurve(obj, ghost.bone_name, ghost.channel)
+            if fcurve is None:
+                continue
 
-        # Re-sample the f-curve value at this ghost's frame
-        new_value = fcurve_utils.sample_fcurve(fcurve, ghost.frame)
-        ghost.local_value = new_value
+            # Re-sample the f-curve value at this ghost's frame
+            new_value = fcurve_utils.sample_fcurve(fcurve, ghost.frame)
+            ghost.local_value = new_value
 
-        # Re-evaluate world position of the ghost in 3D space
-        new_world_pos = fcurve_utils.get_world_position_at_frame(
-            obj, ghost.bone_name, ghost.channel, ghost.frame
-        )
-        ghost.world_position = new_world_pos
+            # Re-evaluate world position of the ghost in 3D space
+            new_world_pos = _get_world_position_cached(
+                depsgraph, scene, obj, ghost.bone_name, ghost.frame, positions[obj.name]
+            )
+            ghost.world_position = new_world_pos
 
-        updated += 1
+            updated += 1
 
     return updated
 

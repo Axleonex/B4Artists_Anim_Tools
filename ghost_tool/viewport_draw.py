@@ -45,38 +45,13 @@ _archetype_preview_cache_key: tuple = ()
 # ---------------------------------------------------------------------------
 
 class _BatchCache:
-    """Lightweight cache for GPU batches keyed by a version stamp.
+    """Bounded to the most recent viewport's marker batches."""
+    def __init__(self):
+        self.clear()
 
-    Batches only rebuild when ghost data changes (store version), the view
-    matrix shifts (camera orbit/pan), or settings change.  Between those
-    events, the same GPU batches are reused for every draw call.
-    """
-
-    __slots__ = ('_store_version', '_view_hash', '_batches')
-
-    def __init__(self) -> None:
-        self._store_version: int = -1
-        self._view_hash: int = 0
-        self._batches: dict[str, object] = {}
-
-    def is_valid(self, store_version: int, view_hash: int) -> bool:
-        return self._store_version == store_version and self._view_hash == view_hash
-
-    def update(self, store_version: int, view_hash: int) -> None:
-        self._store_version = store_version
-        self._view_hash = view_hash
-        self._batches.clear()
-
-    def get(self, key: str):
-        return self._batches.get(key)
-
-    def put(self, key: str, batch) -> None:
-        self._batches[key] = batch
-
-    def clear(self) -> None:
-        self._store_version = -1
-        self._view_hash = 0
-        self._batches.clear()
+    def clear(self):
+        self.key = None
+        self.batches = ()
 
 
 _batch_cache = _BatchCache()
@@ -540,6 +515,112 @@ def _get_ghost_color(
     return _get_level_color(ghost.generation_level)
 
 
+def _build_marker_batches(shader, store, all_ghost_list, settings, ghost_radius,
+                          bb_right, bb_up, current_frame, frame_range):
+    batches = []
+    color_mode = settings.ghost_color_mode
+    fade_factor = settings.ghost_fade_factor
+    # --- Draw ghost markers ---
+    # Preserve level grouping and rounded color buckets.
+    if color_mode == "LEVEL":
+        # Original level-based batching
+        # Levels: 0 = keyframe ghosts, 1-5 = subdivision levels
+        for level in range(0, MAX_SUBDIVISION_LEVEL + 2):
+            if level > 0 and not settings.is_level_visible(level):
+                continue
+
+            ghosts_at_level = store.filter_by_level(level) if level > 0 else [
+                ghost for ghost in all_ghost_list if ghost.generation_level == 0
+            ]
+            if not ghosts_at_level:
+                continue
+
+            level_color = _get_level_color(max(level, 1))
+
+            all_verts: list[Vector] = []
+            all_indices: list[tuple[int, int]] = []
+
+            for ghost in ghosts_at_level:
+                vertex_offset = len(all_verts)
+                circle_verts = _build_3d_circle_verts(
+                    ghost.world_position, ghost_radius, bb_right, bb_up
+                )
+                all_verts.extend(circle_verts)
+                for a, b in _get_circle_indices(SPHERE_SEGMENTS):
+                    all_indices.append((vertex_offset + a, vertex_offset + b))
+
+            if all_verts:
+                batch = batch_for_shader(
+                    shader, 'LINES',
+                    {"pos": [tuple(vertex) for vertex in all_verts]},
+                    indices=all_indices,
+                )
+                batches.append((batch, level_color))
+
+    else:
+        # Per-ghost coloring (TIME, FADE, RAINBOW, KEY_INBETWEEN)
+        # Batching strategy: group ghosts by color bucket (rounded to 2 decimals)
+        # to reduce GPU draw calls to the number of color buckets.
+        color_buckets: dict[tuple, tuple[list, list]] = {}
+
+        for ghost in all_ghost_list:
+            color = _get_ghost_color(
+                ghost, current_frame, frame_range, color_mode, fade_factor,
+                settings=settings,
+            )
+
+            # Adjust radius: ghosts closer to playhead are slightly larger
+            range_width = max(frame_range[1] - frame_range[0], 1.0)
+            normalized_distance = min(abs(ghost.frame - current_frame) / range_width, 1.0)
+            adjusted_radius = ghost_radius * (1.0 + 0.5 * (1.0 - normalized_distance))
+
+            color_key = (round(color[0], 2), round(color[1], 2), round(color[2], 2), round(color[3], 2))
+            if color_key not in color_buckets:
+                color_buckets[color_key] = ([], [])
+
+            verts, indices = color_buckets[color_key]
+            vertex_offset = len(verts)
+            circle_verts = _build_3d_circle_verts(
+                ghost.world_position, adjusted_radius, bb_right, bb_up
+            )
+            verts.extend(tuple(v) for v in circle_verts)
+            for a, b in _get_circle_indices(SPHERE_SEGMENTS):
+                indices.append((vertex_offset + a, vertex_offset + b))
+
+        # One draw call per unique color bucket
+        for color_key, (verts, indices) in color_buckets.items():
+            if verts:
+                batch = batch_for_shader(
+                    shader, 'LINES',
+                    {"pos": verts},
+                    indices=indices,
+                )
+                batches.append((batch, color_key))
+    return tuple(batches)
+
+
+def _get_marker_batches(shader, store, ghosts, settings, radius, right, up,
+                        current_frame, frame_range, context_key=None):
+    # Ghost fields can change in place during drag/API edits without a store
+    # version bump. Compare actual render inputs, never just the version.
+    key = (
+        context_key,
+        tuple((tuple(g.world_position), g.frame, g.generation_level) for g in ghosts),
+        tuple(right), tuple(up), radius, current_frame, frame_range,
+        settings.ghost_color_mode, settings.ghost_fade_factor,
+        settings.ghost_min_alpha, settings.ghost_falloff_curve,
+        tuple(settings.ghost_past_color), tuple(settings.ghost_future_color),
+        tuple(settings.ghost_key_color), tuple(settings.ghost_inbetween_color),
+        tuple(settings.is_level_visible(i) for i in range(1, MAX_SUBDIVISION_LEVEL + 2)),
+        tuple(_get_level_color(i) for i in range(1, MAX_SUBDIVISION_LEVEL + 2)),
+    )
+    if key != _batch_cache.key:
+        batches = _build_marker_batches(shader, store, ghosts, settings, radius,
+                                        right, up, current_frame, frame_range)
+        _batch_cache.key, _batch_cache.batches = key, batches
+    return _batch_cache.batches
+
+
 def draw_ghosts_3d(context: bpy.types.Context) -> None:
     """Main 3D viewport draw callback for all ghost visualization.
 
@@ -636,83 +717,12 @@ def _draw_ghosts_3d_impl(context: bpy.types.Context, settings, scene: bpy.types.
         all_ghost_list = list(store)
         frame_range = store.frame_range
 
-        # --- Draw ghost markers ---
-        # For LEVEL mode, batch by level. For other modes, draw per-ghost for individual colors.
-        if color_mode == "LEVEL":
-            # Original level-based batching
-            # Levels: 0 = keyframe ghosts, 1-5 = subdivision levels
-            for level in range(0, MAX_SUBDIVISION_LEVEL + 2):
-                if level > 0 and not settings.is_level_visible(level):
-                    continue
-
-                ghosts_at_level = store.filter_by_level(level) if level > 0 else [
-                    ghost for ghost in all_ghost_list if ghost.generation_level == 0
-                ]
-                if not ghosts_at_level:
-                    continue
-
-                level_color = _get_level_color(max(level, 1))
-
-                all_verts: list[Vector] = []
-                all_indices: list[tuple[int, int]] = []
-
-                for ghost in ghosts_at_level:
-                    vertex_offset = len(all_verts)
-                    circle_verts = _build_3d_circle_verts(
-                        ghost.world_position, ghost_radius, bb_right, bb_up
-                    )
-                    all_verts.extend(circle_verts)
-                    for a, b in _get_circle_indices(SPHERE_SEGMENTS):
-                        all_indices.append((vertex_offset + a, vertex_offset + b))
-
-                if all_verts:
-                    batch = batch_for_shader(
-                        shader, 'LINES',
-                        {"pos": [tuple(vertex) for vertex in all_verts]},
-                        indices=all_indices,
-                    )
-                    _draw_batch(shader, batch, level_color)
-
-        else:
-            # Per-ghost coloring (TIME, FADE, RAINBOW, KEY_INBETWEEN)
-            # Batching strategy: group ghosts by color bucket (rounded to 2 decimals)
-            # to minimize GPU draw calls. One draw call per unique color achieves O(1)
-            # overhead regardless of ghost count.
-            color_buckets: dict[tuple, tuple[list, list]] = {}
-
-            for ghost in all_ghost_list:
-                color = _get_ghost_color(
-                    ghost, current_frame, frame_range, color_mode, fade_factor,
-                    settings=settings,
-                )
-
-                # Adjust radius: ghosts closer to playhead are slightly larger
-                range_width = max(frame_range[1] - frame_range[0], 1.0)
-                normalized_distance = min(abs(ghost.frame - current_frame) / range_width, 1.0)
-                adjusted_radius = ghost_radius * (1.0 + 0.5 * (1.0 - normalized_distance))
-
-                color_key = (round(color[0], 2), round(color[1], 2), round(color[2], 2), round(color[3], 2))
-                if color_key not in color_buckets:
-                    color_buckets[color_key] = ([], [])
-
-                verts, indices = color_buckets[color_key]
-                vertex_offset = len(verts)
-                circle_verts = _build_3d_circle_verts(
-                    ghost.world_position, adjusted_radius, bb_right, bb_up
-                )
-                verts.extend(tuple(v) for v in circle_verts)
-                for a, b in _get_circle_indices(SPHERE_SEGMENTS):
-                    indices.append((vertex_offset + a, vertex_offset + b))
-
-            # One draw call per unique color bucket
-            for color_key, (verts, indices) in color_buckets.items():
-                if verts:
-                    batch = batch_for_shader(
-                        shader, 'LINES',
-                        {"pos": verts},
-                        indices=indices,
-                    )
-                    _draw_batch(shader, batch, color_key)
+        for batch, color in _get_marker_batches(
+            shader, store, all_ghost_list, settings, ghost_radius, bb_right, bb_up,
+            current_frame, frame_range,
+            (context.window.as_pointer(), region.as_pointer()),
+        ):
+            _draw_batch(shader, batch, color)
 
         # --- Draw selected ghost highlights (SessionState is the single source of truth) ---
         session = SessionState.get(scene)
@@ -1017,7 +1027,8 @@ def _draw_ghosts_3d_impl(context: bpy.types.Context, settings, scene: bpy.types.
                 amplitude = getattr(settings, "archetype_amplitude", 1.0)
                 axis = getattr(settings, "archetype_axis", "Z").lower()
                 cache_key = (
-                    getattr(store, "version", 0),
+                    id(store), getattr(store, "version", 0),
+                    tuple((g.frame, tuple(g.world_position)) for g in all_ghost_list),
                     archetype_name,
                     amplitude,
                     axis,
@@ -1605,7 +1616,7 @@ def _draw_ballistic_preview(
 
     # Map gravity axis name to vector component index (0=X, 1=Y, 2=Z)
     axis_idx = {"X": 0, "Y": 1, "Z": 2}.get(gravity_axis.upper(), 2)
-    fps = bpy.context.scene.render.fps if bpy.context.scene else DEFAULT_FPS
+    fps = (bpy.context.scene.render.fps / bpy.context.scene.render.fps_base) if bpy.context.scene else DEFAULT_FPS
 
     # Collect ghost positions sorted by frame
     sorted_ghosts = sorted(all_ghosts, key=lambda ghost: ghost.frame)
@@ -1981,6 +1992,9 @@ def unregister() -> None:
             warn(f"Failed to remove 2D draw handler: {exc}")
         _draw_handler_2d = None
 
+    global _archetype_preview_cache_key
+    _archetype_preview_cache_key = ()
+    _batch_cache.clear()
     log("Viewport draw handlers unregistered.")
 
 

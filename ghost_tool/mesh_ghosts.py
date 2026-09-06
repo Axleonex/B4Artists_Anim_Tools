@@ -30,7 +30,7 @@ from typing import Optional
 import bpy
 from mathutils import Vector
 
-from .utils import log, warn, debug, tag_viewport_redraw
+from .utils import sampling_operation, is_sampling, log, warn, debug, tag_viewport_redraw
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -241,6 +241,57 @@ def _compute_ghost_color_alpha(
 # Collection management
 # ---------------------------------------------------------------------------
 
+def _get_mesh_collection(scene):
+    for collection in scene.collection.children_recursive:
+        if collection.get('ghost_tool_collection') or collection.name == GHOST_MESH_COLLECTION:
+            return collection
+    return None
+
+
+def _private_mesh_collection(scene):
+    """Detach a shared ghost collection before scene-local mutation."""
+    collection = _get_mesh_collection(scene)
+    if collection is None:
+        return None
+    shared = any(other != scene and collection in tuple(other.collection.children_recursive)
+                 for other in bpy.data.scenes)
+    if not shared:
+        return collection
+    def find_path(parent):
+        for child in parent.children:
+            if child == collection:
+                return [parent, child]
+            path = find_path(child)
+            if path:
+                return [parent] + path
+        return None
+    path = find_path(scene.collection)
+    duplicate = bpy.data.collections.new(GHOST_MESH_COLLECTION)
+    duplicate['ghost_tool_collection'] = True
+    for obj in collection.objects:
+        if not obj.get(GHOST_TOOL_MESH_GHOST_KEY):
+            duplicate.objects.link(obj)
+            continue
+        copied = obj.copy()
+        if obj.data is not None:
+            copied.data = obj.data.copy()
+            if hasattr(copied.data, 'materials'):
+                for i, material in enumerate(copied.data.materials):
+                    if material is not None:
+                        copied.data.materials[i] = material.copy()
+        duplicate.objects.link(copied)
+    replacement = duplicate
+    old_child = collection
+    for parent in reversed(path[1:-1]):
+        private_parent = parent.copy()
+        private_parent.children.unlink(old_child)
+        private_parent.children.link(replacement)
+        replacement, old_child = private_parent, parent
+    scene.collection.children.unlink(old_child)
+    scene.collection.children.link(replacement)
+    return duplicate
+
+
 def _get_or_create_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
     """Get or create the GhostTool mesh ghost collection.
 
@@ -253,18 +304,17 @@ def _get_or_create_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
     Returns:
         The mesh ghost collection.
     """
-    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    coll = _private_mesh_collection(scene)
     if coll is None:
         coll = bpy.data.collections.new(GHOST_MESH_COLLECTION)
-        scene.collection.children.link(coll)
-    elif coll.name not in scene.collection.children:
+        coll["ghost_tool_collection"] = True
         scene.collection.children.link(coll)
 
     # Mark collection as non-selectable / non-renderable by default
     # (user can override in the outliner if needed)
     try:
         layer_coll = _find_layer_collection(
-            bpy.context.view_layer.layer_collection, GHOST_MESH_COLLECTION
+            bpy.context.view_layer.layer_collection, coll.name
         )
         if layer_coll:
             layer_coll.exclude = False
@@ -381,7 +431,7 @@ def _evaluate_and_create_ghost_mesh(
     scene = context.scene
 
     # Move to frame and evaluate
-    scene.frame_set(int(round(frame)))
+    scene.frame_set(math.floor(frame), subframe=frame - math.floor(frame))
     depsgraph = context.evaluated_depsgraph_get()
 
     # Get the evaluated (deformed) mesh
@@ -395,32 +445,38 @@ def _evaluate_and_create_ghost_mesh(
         warn(f"Could not evaluate mesh at frame {frame}: {exc}")
         return None
 
-    if eval_mesh is None:
-        return None
-
-    # Create a new mesh data block from the evaluated mesh
-    ghost_mesh = bpy.data.meshes.new(f"{GHOST_MESH_PREFIX}data_{frame:.0f}")
-    ghost_mesh.from_pydata(
-        [v.co.copy() for v in eval_mesh.vertices],
-        [],
-        [list(p.vertices) for p in eval_mesh.polygons],
-    )
-    ghost_mesh.update()
-
-    # Copy normals for better shading
-    if hasattr(eval_mesh, 'calc_normals'):
-        ghost_mesh.calc_normals()
-
-    # Also copy loop normals for smooth shading
+    ghost_mesh = None
     try:
-        ghost_mesh.normals_split_custom_set_from_vertices(
-            [v.normal.copy() for v in eval_mesh.vertices]
-        )
-    except Exception as exc:
-        warn(f"Could not set custom normals at frame {frame}: {exc}")
+        if eval_mesh is None:
+            return None
 
-    # Clean up the evaluated mesh
-    eval_obj.to_mesh_clear()
+        # Create a new mesh data block from the evaluated mesh
+        ghost_mesh = bpy.data.meshes.new(f"{GHOST_MESH_PREFIX}data_{frame:.0f}")
+        ghost_mesh.from_pydata(
+            [v.co.copy() for v in eval_mesh.vertices],
+            [tuple(e.vertices) for e in eval_mesh.edges],
+            [list(p.vertices) for p in eval_mesh.polygons],
+        )
+        ghost_mesh.update()
+
+        # Copy normals for better shading
+        if hasattr(eval_mesh, 'calc_normals'):
+            ghost_mesh.calc_normals()
+
+        # Copy vertex normals for smooth shading
+        try:
+            ghost_mesh.normals_split_custom_set_from_vertices(
+                [v.normal.copy() for v in eval_mesh.vertices]
+            )
+        except Exception as exc:
+            warn(f"Could not set custom normals at frame {frame}: {exc}")
+
+    except Exception:
+        if ghost_mesh is not None and ghost_mesh.users == 0:
+            bpy.data.meshes.remove(ghost_mesh)
+        raise
+    finally:
+        eval_obj.to_mesh_clear()
 
     # Create the ghost object
     ghost_name = f"{GHOST_MESH_PREFIX}f{frame:.0f}"
@@ -430,6 +486,7 @@ def _evaluate_and_create_ghost_mesh(
     # Set early, right after object creation
     ghost_obj[GHOST_TOOL_MESH_GHOST_KEY] = True
     ghost_obj[GHOST_TOOL_FRAME_KEY] = frame
+    ghost_obj["ghost_tool_source"] = mesh_obj.name
     ghost_obj[GHOST_TOOL_IS_PAST_KEY] = (frame < current_frame)
 
     # Position: copy world matrix from the evaluated source
@@ -439,7 +496,7 @@ def _evaluate_and_create_ghost_mesh(
     color, alpha = _compute_ghost_color_alpha(
         frame, current_frame, frame_range_width, settings=scene_settings,
     )
-    mat_name = f"GhostMat_{frame:.0f}"
+    mat_name = f"GhostMat_{ghost_obj.name}"
 
     if use_wire:
         # Use the computed falloff alpha instead of the fixed WIREFRAME_ALPHA,
@@ -450,6 +507,10 @@ def _evaluate_and_create_ghost_mesh(
         mat = _get_or_create_ghost_material(mat_name, color, alpha)
 
     ghost_obj.data.materials.append(mat)
+    ghost_obj[GHOST_TOOL_BASE_ALPHA_KEY] = min(alpha, WIREFRAME_ALPHA) if use_wire else alpha
+    if scene_settings:
+        ghost_obj.hide_viewport = not (scene_settings.show_mesh_past if frame < current_frame
+                                       else scene_settings.show_mesh_future)
 
     # Display settings
     if use_wire:
@@ -476,6 +537,7 @@ def _evaluate_and_create_ghost_mesh(
     return ghost_obj
 
 
+@sampling_operation
 def generate_mesh_ghosts(
     context: bpy.types.Context,
     source_obj: bpy.types.Object,
@@ -505,14 +567,6 @@ def generate_mesh_ghosts(
     """
     scene = context.scene
     current_frame = scene.frame_current
-    original_frame = current_frame
-    depsgraph = context.evaluated_depsgraph_get()
-
-    # Clear any existing mesh ghosts first
-    clear_mesh_ghosts(context)
-
-    # Get or create the collection
-    coll = _get_or_create_collection(scene)
 
     # Determine the actual mesh object to duplicate
     mesh_obj = _resolve_mesh_object(source_obj)
@@ -526,14 +580,17 @@ def generate_mesh_ghosts(
     )
 
     if not all_frames:
+        clear_mesh_ghosts(context)
         warn("No valid frames for mesh ghost generation.")
-        scene.frame_set(original_frame)
         return 0
 
     # Compute frame range for alpha falloff
     min_frame = min(all_frames)
     max_frame = max(all_frames)
     frame_range_width = max(max_frame - min_frame, 1.0)
+
+    clear_mesh_ghosts(context)
+    coll = _get_or_create_collection(scene)
 
     created = 0
     failed = 0
@@ -555,9 +612,6 @@ def generate_mesh_ghosts(
             created += 1
         else:
             failed += 1
-
-    # Restore the original frame
-    scene.frame_set(original_frame)
 
     if failed > 0:
         log(f"Created {created} of {created + failed} mesh ghosts ({failed} failed to evaluate)")
@@ -591,7 +645,7 @@ def _apply_outline_modifier(
     outline_rgb = tuple(settings.ghost_outline_color)
 
     # Create the outline material (opaque dark)
-    outline_mat_name = f"GhostOutline_{ghost_frame:.0f}"
+    outline_mat_name = f"GhostOutline_{ghost_obj.name}"
     outline_mat = bpy.data.materials.get(outline_mat_name)
     if outline_mat is None:
         outline_mat = bpy.data.materials.new(name=outline_mat_name)
@@ -672,16 +726,21 @@ def clear_mesh_ghosts(context: bpy.types.Context) -> int:
     Returns:
         int: Number of mesh ghosts removed.
     """
+    scene = context.scene
     removed = 0
+    owned_materials = set()
 
-    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    coll = _private_mesh_collection(scene)
     if coll is not None:
         # Collect objects to remove
-        objects_to_remove = list(coll.objects)
+        objects_to_remove = [obj for obj in coll.objects if obj.get(GHOST_TOOL_MESH_GHOST_KEY)]
 
         for obj in objects_to_remove:
             # Store mesh data ref before unlinking
             mesh_data = obj.data if obj.type == 'MESH' else None
+
+            if mesh_data:
+                owned_materials.update(mat for mat in mesh_data.materials if mat)
 
             # Unlink from collection
             coll.objects.unlink(obj)
@@ -701,8 +760,7 @@ def clear_mesh_ghosts(context: bpy.types.Context) -> int:
 
     # Clean up ghost materials with zero users
     mats_to_remove = [
-        mat for mat in bpy.data.materials
-        if mat.name.startswith("GhostMat_") and mat.users == 0
+        mat for mat in owned_materials if mat.users == 0
     ]
     for mat in mats_to_remove:
         bpy.data.materials.remove(mat)
@@ -735,7 +793,7 @@ def update_mesh_ghost_visibility(
         show_future:   Whether future-frame ghosts should be visible.
         opacity_scale: Multiplier for ghost opacity (0.0–1.0).
     """
-    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    coll = _private_mesh_collection(scene)
     if coll is None:
         return
 
@@ -766,13 +824,14 @@ def update_mesh_ghost_visibility(
                         break
 
 
-def set_mesh_ghost_display_mode(mode: str = "SOLID") -> None:
+def set_mesh_ghost_display_mode(mode: str = "SOLID", scene=None) -> None:
     """Change display mode for all mesh ghosts.
 
     Args:
         mode: "SOLID", "WIRE", or "BOUNDS".
     """
-    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    scene = scene or bpy.context.scene
+    coll = _private_mesh_collection(scene)
     if coll is None:
         return
 
@@ -785,6 +844,7 @@ def set_mesh_ghost_display_mode(mode: str = "SOLID") -> None:
 # Frame-change handler — auto-update mesh ghost positions
 # ---------------------------------------------------------------------------
 
+@bpy.app.handlers.persistent
 def _on_frame_change(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
     """Handler called on frame change to update mesh ghost appearance.
 
@@ -797,6 +857,8 @@ def _on_frame_change(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> 
         scene:     The Blender scene.
         depsgraph: The evaluated dependency graph.
     """
+    if is_sampling():
+        return
     if not hasattr(scene, 'ghost_tool'):
         return
 
@@ -804,7 +866,7 @@ def _on_frame_change(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> 
     if not settings.is_active or not settings.show_mesh_ghosts:
         return
 
-    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    coll = _private_mesh_collection(scene)
     if coll is None or len(coll.objects) == 0:
         return
 
@@ -858,6 +920,19 @@ def _on_frame_change(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> 
 # Incremental mesh ghost update (live mode)
 # ---------------------------------------------------------------------------
 
+def _same_mesh_topology(source, target):
+    """Vertex counts alone miss animated connectivity/face changes."""
+    if (len(source.vertices), len(source.edges), len(source.polygons), len(source.loops)) != (
+            len(target.vertices), len(target.edges), len(target.polygons), len(target.loops)):
+        return False
+    # from_pydata may reorder edges; faces/loops retain source order.
+    if any(tuple(a.vertices) != tuple(b.vertices) for a, b in zip(source.polygons, target.polygons)):
+        return False
+    return {tuple(sorted(e.vertices)) for e in source.edges} == {
+        tuple(sorted(e.vertices)) for e in target.edges}
+
+
+@sampling_operation
 def update_mesh_ghosts_incremental(
     context: bpy.types.Context,
 ) -> bool:
@@ -878,14 +953,13 @@ def update_mesh_ghosts_incremental(
         bool: True if update succeeded, False if a full rebuild is needed.
     """
     scene = context.scene
-    coll = bpy.data.collections.get(GHOST_MESH_COLLECTION)
+    coll = _private_mesh_collection(scene)
 
     if coll is None or len(coll.objects) == 0:
         return False  # No existing ghosts — need full generate
 
     settings = scene.ghost_tool
     current_frame = scene.frame_current
-    original_frame = current_frame
 
     # Gather existing ghost objects with their frame numbers
     ghost_objects = []
@@ -921,6 +995,9 @@ def update_mesh_ghosts_incremental(
     if mesh_obj is None:
         return False
 
+    if any(obj.get('ghost_tool_source') != mesh_obj.name for _frame, obj in ghost_objects):
+        return False
+
     # Compute frame range for color/alpha
     all_frames = [f for f, _ in ghost_objects]
     min_frame = min(all_frames)
@@ -931,7 +1008,7 @@ def update_mesh_ghosts_incremental(
 
     for frame, ghost_obj in ghost_objects:
         # Move to frame and evaluate
-        scene.frame_set(int(round(frame)))
+        scene.frame_set(math.floor(frame), subframe=frame - math.floor(frame))
         depsgraph = context.evaluated_depsgraph_get()
 
         eval_obj = mesh_obj.evaluated_get(depsgraph)
@@ -945,38 +1022,40 @@ def update_mesh_ghosts_incremental(
             success = False
             continue
 
-        if eval_mesh is None:
-            success = False
-            continue
+        try:
+            if eval_mesh is None:
+                success = False
+                continue
 
-        ghost_mesh = ghost_obj.data
+            ghost_mesh = ghost_obj.data
 
-        # Check vertex count matches — if not, topology changed, need rebuild
-        if len(eval_mesh.vertices) != len(ghost_mesh.vertices):
+            # Check topology matches — if not, topology changed, need rebuild
+            if not _same_mesh_topology(eval_mesh, ghost_mesh):
+                success = False
+                break  # Topology mismatch — full rebuild required
+
+            # Fast bulk vertex position update via foreach_set
+            vertex_count = len(eval_mesh.vertices)
+            flattened_vertex_coords = [0.0] * (vertex_count * COORDS_PER_VERTEX)
+            eval_mesh.vertices.foreach_get('co', flattened_vertex_coords)
+            ghost_mesh.vertices.foreach_set('co', flattened_vertex_coords)
+
+            # Notify Blender that geometry changed
+            ghost_mesh.update()
+
+        finally:
             eval_obj.to_mesh_clear()
-            success = False
-            break  # Topology mismatch — full rebuild required
-
-        # Fast bulk vertex position update via foreach_set
-        vertex_count = len(eval_mesh.vertices)
-        flattened_vertex_coords = [0.0] * (vertex_count * COORDS_PER_VERTEX)
-        eval_mesh.vertices.foreach_get('co', flattened_vertex_coords)
-        ghost_mesh.vertices.foreach_set('co', flattened_vertex_coords)
-
-        # Notify Blender that geometry changed
-        ghost_mesh.update()
-
-        # Clean up
-        eval_obj.to_mesh_clear()
 
         # Update world matrix (in case armature moved)
         ghost_obj.matrix_world = mesh_obj.matrix_world.copy()
 
         # Update color/alpha based on new current frame
         color, alpha = _compute_ghost_color_alpha(
-            frame, current_frame, frame_range_width
+            frame, current_frame, frame_range_width, settings=settings
         )
         ghost_obj[GHOST_TOOL_IS_PAST_KEY] = (frame < current_frame)
+        if settings.mesh_ghost_mode == "WIRE":
+            alpha = min(alpha, WIREFRAME_ALPHA)
         ghost_obj[GHOST_TOOL_BASE_ALPHA_KEY] = alpha
 
         if ghost_obj.data.materials:
@@ -995,9 +1074,6 @@ def update_mesh_ghosts_incremental(
         show_future = settings.show_mesh_future
         is_past = frame < current_frame
         ghost_obj.hide_viewport = (not show_past) if is_past else (not show_future)
-
-    # Restore frame
-    scene.frame_set(original_frame)
 
     return success
 
@@ -1022,24 +1098,19 @@ def _get_keyframe_frames_for_object(obj: bpy.types.Object) -> list[float]:
 
     frames: set[float] = set()
 
-    # Collect from the object itself
-    anim_data = obj.animation_data
-    if anim_data and anim_data.action:
-        fcurves = get_fcurves_from_action(anim_data.action, obj)
-        debug(f"Keyframe scan: {obj.name} has {len(fcurves)} fcurves")
-        for fcurve in fcurves:
-            for kp in fcurve.keyframe_points:
-                frames.add(float(kp.co.x))
-
-    # For armatures, also scan children (they may have shape key actions)
+    sources = [obj]
     if obj.type == 'ARMATURE':
-        for child in obj.children:
-            child_anim = child.animation_data
-            if child_anim and child_anim.action:
-                child_fcurves = get_fcurves_from_action(child_anim.action, child)
-                for fcurve in child_fcurves:
-                    for kp in fcurve.keyframe_points:
-                        frames.add(float(kp.co.x))
+        sources.extend(obj.children_recursive)
+    for source in sources:
+        owners = [source]
+        shape_keys = getattr(getattr(source, 'data', None), 'shape_keys', None)
+        if shape_keys is not None:
+            owners.append(shape_keys)
+        for owner in owners:
+            animation = owner.animation_data
+            if animation and animation.action:
+                for curve in get_fcurves_from_action(animation.action, owner):
+                    frames.update(float(key.co.x) for key in curve.keyframe_points)
 
     debug(f"Keyframe scan total: {len(frames)} unique keyframe frames for {obj.name}")
     return sorted(frames)

@@ -279,7 +279,7 @@ class GHOST_OT_apply_easing(bpy.types.Operator):
         from . import fcurve_utils
 
         store = GhostStore.get(context.scene)
-        selected = store.get_selected()
+        selected = store.get_selected(context.scene)
 
         if not selected:
             # If no ghosts selected, try to apply to all ghost parent ranges

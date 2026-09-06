@@ -48,7 +48,8 @@ from .ghost_data import (
     LOCATION_CHANNELS,
 )
 from .ghost_cache import GhostCache
-from .utils import log, warn, debug, get_scene_id, tag_viewport_redraw
+from .session_state import SessionState
+from .utils import is_sampling, log, warn, debug, get_scene_id, tag_viewport_redraw
 
 # ---------------------------------------------------------------------------
 # Bake state flags — read by the 2D draw handler for HUD and preview
@@ -229,10 +230,6 @@ class GhostPipeline:
         store = GhostStore.get(context.scene)
         settings = context.scene.ghost_tool
 
-        if clear_existing:
-            store.clear()
-            cache.invalidate_all()
-
         # Determine generation mode from settings; ghost_mode: SUBDIVISION, FRAME_STEP, or KEYFRAMES_ONLY
         mode = settings.ghost_mode
 
@@ -243,8 +240,10 @@ class GhostPipeline:
             context, obj, armature, bones, channels, level, frame_range, mode, settings
         )
 
-        # Store results
-        store.replace_all(ghosts)
+        # Publish only after evaluation succeeds.
+        if clear_existing:
+            cache.invalidate_all()
+        store.replace_all(ghosts if clear_existing else store.all_ghosts + ghosts)
 
         # Update cache metadata
         cache.last_frame = context.scene.frame_current
@@ -296,10 +295,6 @@ class GhostPipeline:
         store = GhostStore.get(context.scene)
         settings = context.scene.ghost_tool
 
-        if clear_existing:
-            store.clear()
-            cache.invalidate_all()
-
         mode = settings.ghost_mode
         debug(f"Manual generate (with preview): mode={mode}, obj={obj.name}")
 
@@ -322,11 +317,13 @@ class GhostPipeline:
             )
             _staging_store.replace_all(all_ghosts)
             final_ghosts = all_ghosts
+            if clear_existing:
+                cache.invalidate_all()
+            store.replace_all(all_ghosts if clear_existing else store.all_ghosts + all_ghosts)
             tag_viewport_redraw(context)
 
         finally:
-            # Atomic swap: move staging into the main store regardless of outcome
-            store.replace_all(final_ghosts)
+            # Failed evaluation leaves the previous store intact.
             _BAKE_IN_PROGRESS = False
             _staging_store = None
 
@@ -363,6 +360,10 @@ class GhostPipeline:
         live_points = settings.live_point_ghosts
         live_mesh = settings.live_mesh_ghosts
         if not live_points and not live_mesh:
+            return False
+
+        # Keep the store stable while a modal drag holds ghost references.
+        if SessionState.get(scene).drag_active:
             return False
 
         # Check freeze
@@ -484,7 +485,7 @@ class GhostPipeline:
                 bones = [b.name for b in context.selected_pose_bones]
             elif obj.data.bones:
                 # Try bones marked as selected
-                bones = [b.name for b in obj.data.bones if b.select]
+                bones = [b.name for b in obj.pose.bones if getattr(b, "select", getattr(b.bone, "select", False))]
             # Fallback: use all bones if none are selected (e.g. Object Mode)
             if not bones and obj.pose and obj.pose.bones:
                 bones = [b.name for b in obj.pose.bones]
@@ -722,11 +723,11 @@ def _schedule_deferred_update() -> None:
     bpy.app.timers.register(_deferred_live_update, first_interval=0.0)
 
 
-def _deferred_live_update() -> None:
+def _deferred_live_update() -> Optional[float]:
     """Timer callback that performs the actual live ghost regeneration.
 
     This runs in a safe context where scene.frame_set() is allowed.
-    Returns None to run only once (no repeat).
+    Returns a delay when throttled or dragging; None finishes the timer.
     """
     global _deferred_update_pending
     _deferred_update_pending = False
@@ -749,6 +750,10 @@ def _deferred_live_update() -> None:
         if settings.live_freeze:
             return None
 
+        if SessionState.get(scene).drag_active:
+            _deferred_update_pending = True
+            return 0.05
+
         # Skip during animation playback to avoid performance issues
         if context.screen and context.screen.is_animation_playing:
             return None
@@ -761,13 +766,10 @@ def _deferred_live_update() -> None:
         throttle_sec = throttle_ms / 1000.0
         now = time.monotonic()
         if now - cache.last_update_time <= throttle_sec:
-            # Re-schedule if we're throttled but still dirty
+            # Let Blender reschedule this same timer while still dirty
             if cache.is_dirty:
                 _deferred_update_pending = True
-                bpy.app.timers.register(
-                    _deferred_live_update,
-                    first_interval=max(0.01, throttle_sec - (now - cache.last_update_time)),
-                )
+                return max(0.01, throttle_sec - (now - cache.last_update_time))
             return None
 
         # Check if anything actually changed
@@ -821,7 +823,7 @@ def _schedule_forced_mesh_regen() -> None:
     bpy.app.timers.register(_forced_mesh_regen_callback, first_interval=0.0)
 
 
-def _forced_mesh_regen_callback() -> None:
+def _forced_mesh_regen_callback() -> Optional[float]:
     """Timer callback that forces a FULL mesh ghost rebuild.
 
     Unlike _update_mesh_ghosts_live which tries incremental first,
@@ -841,6 +843,10 @@ def _forced_mesh_regen_callback() -> None:
         if not settings.is_active or not settings.show_mesh_ghosts:
             return None
 
+        if SessionState.get(scene).drag_active:
+            _forced_mesh_regen_pending = True
+            return 0.05
+
         from .mesh_ghosts import (
             clear_mesh_ghosts,
             generate_mesh_ghosts,
@@ -853,9 +859,6 @@ def _forced_mesh_regen_callback() -> None:
 
         frame_mode = settings.mesh_ghost_frame_mode
         print(f"[GhostTool] Forced regen START (frame_mode={frame_mode})")
-
-        # Always clear first — the frame list may have changed entirely
-        clear_mesh_ghosts(context)
 
         obj = context.active_object
         if obj is None:
@@ -893,6 +896,9 @@ def _forced_mesh_regen_callback() -> None:
                 step=1,
             )
 
+        else:
+            clear_mesh_ghosts(context)
+
         # Update cache state so the pipeline knows we're current
         pipeline = GhostPipeline.get(scene)
         cache = pipeline._get_cache()
@@ -914,6 +920,7 @@ def _forced_mesh_regen_callback() -> None:
     return None
 
 
+@bpy.app.handlers.persistent
 def _on_frame_change_pipeline(scene: bpy.types.Scene, depsgraph=None) -> None:
     """Handler called on frame_change_post.
 
@@ -925,7 +932,7 @@ def _on_frame_change_pipeline(scene: bpy.types.Scene, depsgraph=None) -> None:
         scene: The scene that changed.
         depsgraph: The dependency graph (unused, but required by Blender).
     """
-    if not hasattr(scene, 'ghost_tool'):
+    if is_sampling() or not hasattr(scene, 'ghost_tool'):
         return
 
     settings = scene.ghost_tool
@@ -946,6 +953,7 @@ def _on_frame_change_pipeline(scene: bpy.types.Scene, depsgraph=None) -> None:
     _schedule_deferred_update()
 
 
+@bpy.app.handlers.persistent
 def _on_depsgraph_update_pipeline(scene: bpy.types.Scene, depsgraph=None) -> None:
     """Handler called on depsgraph_update_post.
 
@@ -956,7 +964,7 @@ def _on_depsgraph_update_pipeline(scene: bpy.types.Scene, depsgraph=None) -> Non
         scene: The scene that was updated.
         depsgraph: The dependency graph with update info.
     """
-    if not hasattr(scene, 'ghost_tool'):
+    if is_sampling() or not hasattr(scene, 'ghost_tool'):
         return
 
     # Skip if a forced regen is in progress — our own clear/generate
@@ -1050,6 +1058,36 @@ def _unregister_live_handlers() -> None:
 # Registration
 # ---------------------------------------------------------------------------
 
+@bpy.app.handlers.persistent
+def _on_file_load(_unused):
+    global _deferred_update_pending, _forced_mesh_regen_pending, _in_forced_regen
+    global _BAKE_IN_PROGRESS, _staging_store
+    _deferred_update_pending = _forced_mesh_regen_pending = _in_forced_regen = False
+    _BAKE_IN_PROGRESS = False
+    _staging_store = None
+    for callback in (_deferred_live_update, _forced_mesh_regen_callback):
+        if bpy.app.timers.is_registered(callback):
+            bpy.app.timers.unregister(callback)
+    GhostPipeline.clear_all_instances()
+    GhostCache.clear_all_instances()
+    GhostStore.clear_all_instances()
+    SessionState.clear_all_instances()
+    from .snapshot import SnapshotStore
+    from .ghost_data import DiffReference
+    from .fcurve_utils import invalidate_keyframe_cache, clear_frame_cache
+    from .physics_suggest import _clear_physics_preview
+    from .viewport_draw import _batch_cache
+    SnapshotStore.clear_all_instances()
+    DiffReference.clear_all()
+    invalidate_keyframe_cache()
+    clear_frame_cache()
+    _clear_physics_preview()
+    _batch_cache.clear()
+    _register_live_handlers()
+    if bpy.context.scene and getattr(bpy.context.scene, 'ghost_tool', None):
+        _schedule_deferred_update()
+
+
 def register() -> None:
     """Register the pipeline module.
 
@@ -1058,6 +1096,8 @@ def register() -> None:
     update_if_needed() checks the live toggle before doing real work.
     """
     _register_live_handlers()
+    if _on_file_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_file_load)
     from .session_state import _on_undo_redo
     if _on_undo_redo not in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.append(_on_undo_redo)
@@ -1072,6 +1112,8 @@ def unregister() -> None:
     Removes app handlers and clears all pipeline instances.
     """
     from .session_state import _on_undo_redo
+    if _on_file_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_file_load)
     try:
         bpy.app.handlers.undo_post.remove(_on_undo_redo)
     except ValueError:
@@ -1084,6 +1126,9 @@ def unregister() -> None:
     _deferred_update_pending = False
     _forced_mesh_regen_pending = False
     _in_forced_regen = False
+    for callback in (_deferred_live_update, _forced_mesh_regen_callback):
+        if bpy.app.timers.is_registered(callback):
+            bpy.app.timers.unregister(callback)
     _unregister_live_handlers()
     GhostPipeline.clear_all_instances()
     GhostCache.clear_all_instances()

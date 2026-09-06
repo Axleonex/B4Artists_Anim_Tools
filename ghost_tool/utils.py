@@ -12,6 +12,8 @@ diagnostic output can be filtered from a single location.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from functools import wraps
 from typing import Optional
 
 import bpy
@@ -39,20 +41,12 @@ _SCENE_ID_KEY = "ghost_tool_scene_id"
 def get_scene_id(scene) -> str:
     """Return a stable unique ID for a scene, creating one if needed.
 
-    Uses a custom property stored on the scene so the ID survives
-    save/load and is immune to scene renames.
+    Uses runtime identity, independent of scene names and duplicated properties.
+    JSON export/import handles persistence; file loading clears transient stores.
     """
-    import uuid
-    sid = scene.get(_SCENE_ID_KEY)
-    if sid is None:
-        sid = uuid.uuid4().hex[:12]
-        try:
-            scene[_SCENE_ID_KEY] = sid
-        except Exception:
-            # Can't write custom property (e.g. during panel draw or
-            # other restricted contexts). Fall back to scene.name.
-            return scene.name
-    return sid
+    # A persisted custom property is copied by Scene.copy(), causing two
+    # scenes to share every transient store. RNA session identity is unique.
+    return str(getattr(scene, 'session_uid', scene.as_pointer()))
 
 
 def log(message: str) -> None:
@@ -469,7 +463,7 @@ def get_selected_bone_names(context: bpy.types.Context) -> list[str]:
         return [b.name for b in context.selected_pose_bones]
 
     # Fallback: check bone selection state directly
-    return [b.name for b in obj.data.bones if b.select]
+    return [b.name for b in obj.pose.bones if getattr(b, "select", getattr(b.bone, "select", False))]
 
 
 # ---------------------------------------------------------------------------
@@ -657,3 +651,41 @@ def lerp(a: float, b: float, t: float) -> float:
 # ... )
 # >>> assert hit is not None
 # >>> assert abs(hit.z) < 0.001
+
+# Internal sampling must neither move the user's playhead permanently nor
+# enqueue another live bake through our own frame/depsgraph handlers.
+_SAMPLING_DEPTH = 0
+
+
+def is_sampling() -> bool:
+    return _SAMPLING_DEPTH > 0
+
+
+@contextmanager
+def scene_sampling(scene):
+    global _SAMPLING_DEPTH
+    from . import ghost_data
+    if ghost_data._IN_DRAW_HANDLER:
+        raise RuntimeError("Scene sampling is forbidden inside a draw handler")
+    frame, subframe = scene.frame_current, scene.frame_subframe
+    _SAMPLING_DEPTH += 1
+    try:
+        yield
+    finally:
+        try:
+            if (scene.frame_current, scene.frame_subframe) != (frame, subframe):
+                scene.frame_set(frame, subframe=subframe)
+        finally:
+            _SAMPLING_DEPTH -= 1
+
+
+def sampling_operation(function):
+    """Protect an entire point or mesh sampling pass, including error paths."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        context = kwargs.get('context')
+        if context is None:
+            context = args[0] if args and isinstance(args[0], bpy.types.Context) else bpy.context
+        with scene_sampling(context.scene):
+            return function(*args, **kwargs)
+    return wrapped

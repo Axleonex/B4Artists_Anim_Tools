@@ -120,7 +120,7 @@ def _build_circle_verts(
 
 def _collect_current_bone_positions(
     scene: bpy.types.Scene,
-) -> dict[str, Vector]:
+) -> dict[tuple[str, str], Vector]:
     """Sample the world-space position of every visible pose bone at the current frame.
 
     Reads directly from the evaluated depsgraph (no frame_set calls needed)
@@ -132,7 +132,7 @@ def _collect_current_bone_positions(
     Returns:
         dict mapping bone_name → world-space Vector.
     """
-    positions: dict[str, Vector] = {}
+    positions: dict[tuple[str, str], Vector] = {}
     try:
         dg = bpy.context.evaluated_depsgraph_get()
     except (AttributeError, RuntimeError) as exc:
@@ -149,7 +149,7 @@ def _collect_current_bone_positions(
                 continue
             for bone in obj_eval.pose.bones:
                 mat = obj_eval.matrix_world @ bone.matrix
-                positions[bone.name] = mat.translation.copy()
+                positions[(obj.name, bone.name)] = mat.translation.copy()
         except (AttributeError, RuntimeError) as exc:
             debug(f"diff_mode: error reading bone positions for {obj.name!r}: {exc}")
 
@@ -179,18 +179,22 @@ def _check_staleness(
         # Already flagged — no need to re-hash every tick
         return
 
-    # Find the first armature in the scene (same logic as pin_reference)
-    obj = _find_anchor_object(scene)
-    if obj is None:
+    # Staleness is a warning, not animated geometry: cap expensive key hashing
+    # at 10 Hz even when the viewport redraws much faster.
+    import time
+    now = time.monotonic()
+    if now - getattr(diff_ref, '_last_hash_check', 0.0) < 0.1:
         return
-
-    current_hash = compute_anchor_hash(obj, diff_ref.anchor_frame)
-    if current_hash and current_hash != diff_ref.anchor_hash:
+    diff_ref._last_hash_check = now
+    current_hash = _scene_anchor_hash(scene, diff_ref.anchor_frame)
+    if current_hash != diff_ref.anchor_hash:
         diff_ref.state = AnchorState.STALE
-        debug(
-            f"diff_mode: anchor at f{diff_ref.anchor_frame} is STALE "
-            f"(hash changed from {diff_ref.anchor_hash[:8]} to {current_hash[:8]})"
-        )
+
+
+def _scene_anchor_hash(scene, frame):
+    import hashlib
+    parts = [(obj.name, compute_anchor_hash(obj, frame)) for obj in scene.objects if obj.type == 'ARMATURE']
+    return hashlib.sha256(repr(sorted(parts)).encode()).hexdigest()[:16]
 
 
 def _find_anchor_object(scene: bpy.types.Scene) -> Optional[bpy.types.Object]:
@@ -288,13 +292,14 @@ def draw_diff_overlay(
     current_positions = _collect_current_bone_positions(scene)
 
     # Group ghosts by bone so we only draw one ring per bone per frame
-    bone_to_ghosts: dict[str, list[Ghost]] = {}
+    bone_to_ghosts: dict[tuple[str, str], list[Ghost]] = {}
     for ghost in store:
         if not ghost.bone_name:
             continue
-        if ghost.bone_name not in bone_to_ghosts:
-            bone_to_ghosts[ghost.bone_name] = []
-        bone_to_ghosts[ghost.bone_name].append(ghost)
+        key = (ghost.object_name, ghost.bone_name)
+        if key not in bone_to_ghosts:
+            bone_to_ghosts[key] = []
+        bone_to_ghosts[key].append(ghost)
 
     _gpu.state.blend_set('ALPHA')
     _gpu.state.line_width_set(2.0)
@@ -395,8 +400,7 @@ class GHOST_OT_pin_diff_reference(bpy.types.Operator):
             return {'CANCELLED'}
 
         # Compute anchor hash for Staleness Guard
-        obj = _find_anchor_object(scene)
-        anchor_hash = compute_anchor_hash(obj, anchor_frame) if obj else ""
+        anchor_hash = _scene_anchor_hash(scene, anchor_frame)
 
         diff_ref = DiffReference(
             anchor_frame=anchor_frame,

@@ -46,6 +46,7 @@ class SessionState:
         """Initialize with empty hover and selection state."""
         self.hovered_ghost_uid: Optional[str] = None
         self.selection_set: set[str] = set()
+        self.drag_active = False
 
     # --- Singleton access per scene ---
 
@@ -142,12 +143,14 @@ class SessionState:
         """Reset all transient state (called after ghost regeneration)."""
         self.hovered_ghost_uid = None
         self.selection_set.clear()
+        self.drag_active = False
 
 
 # ---------------------------------------------------------------------------
 # Undo/Redo Handler
 # ---------------------------------------------------------------------------
 
+@bpy.app.handlers.persistent
 def _on_undo_redo(scene: bpy.types.Scene, *args) -> None:
     """Clear transient session state and invalidate caches after undo/redo.
 
@@ -161,6 +164,11 @@ def _on_undo_redo(scene: bpy.types.Scene, *args) -> None:
     Args:
         scene: The scene that was affected by undo/redo.
     """
+    if scene is None or not isinstance(scene, bpy.types.Scene):
+        scene = bpy.context.scene
+    if scene is None:
+        return
+
     # Clear transient session state (hover, selection)
     state = SessionState.get(scene)
     state.clear_all()
@@ -168,7 +176,7 @@ def _on_undo_redo(scene: bpy.types.Scene, *args) -> None:
     # Invalidate caches so stale ghosts don't persist after undo
     from .ghost_cache import GhostCache
     from .ghost_pipeline import GhostPipeline
-    from .fcurve_utils import invalidate_keyframe_cache
+    from .fcurve_utils import invalidate_keyframe_cache, clear_frame_cache
 
     cache = GhostCache.get(scene)
     cache.invalidate_all()
@@ -178,3 +186,6 @@ def _on_undo_redo(scene: bpy.types.Scene, *args) -> None:
 
     # Clear sorted keyframe cache (keyframe edits may have been undone)
     invalidate_keyframe_cache()
+    clear_frame_cache()
+    from .ghost_pipeline import _schedule_deferred_update
+    _schedule_deferred_update()

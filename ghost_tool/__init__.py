@@ -14,10 +14,10 @@ unregister functions are called in the correct dependency order.
 bl_info = {
     "name": "Ghost Tool",
     "author": "GoingGhost",
-    "version": (3, 3, 1),
+    "version": (3, 3, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Ghost Tool",
-    "description": "Ghost keyframe visualization and manipulation for Bforartists. v3.3.1 fixes clean add-on teardown and improves workflow clarity.",
+    "description": "Ghost keyframe visualization and manipulation for Bforartists. v3.3.3 adds validated imports, exact snapshots, scene isolation, and animation correctness fixes.",
     "category": "Animation",
     "doc_url": "",
     "tracker_url": "",
@@ -234,6 +234,10 @@ def _unregister_supported() -> None:
         api.clear_all_callbacks()
     except Exception as exc:
         utils.warn(f"Failed to clear API callbacks during unregister: {exc}")
+
+    from .fcurve_utils import invalidate_keyframe_cache, clear_frame_cache
+    invalidate_keyframe_cache()
+    clear_frame_cache()
 
     try:
         from .session_state import SessionState

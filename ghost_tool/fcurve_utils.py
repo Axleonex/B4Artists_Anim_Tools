@@ -18,7 +18,7 @@ from typing import Optional
 import bpy
 from mathutils import Vector
 
-from .utils import log, warn, debug
+from .utils import sampling_operation, log, warn, debug
 
 
 # ---------------------------------------------------------------------------
@@ -107,38 +107,24 @@ def sample_fcurve(fcurve: bpy.types.FCurve, frame: float) -> float:
 # Sorted Keyframe Cache — avoids re-sorting every call
 # ---------------------------------------------------------------------------
 
-# Cache maps (action_name, fcurve_data_path, fcurve_array_index) → sorted keyframe list.
-# Cleared on undo/redo and when the pipeline regenerates.
-_sorted_kf_cache: dict[tuple[str, str, int], list[bpy.types.Keyframe]] = {}
+# Cache only the permutation, never persistent Keyframe RNA references: keys
+# can be deleted/replaced or reordered without changing their count.
+_sorted_kf_cache: dict[int, tuple[tuple[float, ...], tuple[int, ...]]] = {}
 
 
 def _get_sorted_keyframes(fcurve: bpy.types.FCurve) -> list[bpy.types.Keyframe]:
-    """Return a cached sorted list of keyframe_points for an f-curve.
-
-    Sorting is O(n log n) and was being done on every call to
-    get_adjacent_keyframes.  This caches the result keyed by the
-    f-curve identity (action + data_path + index).
-
-    Args:
-        fcurve: The f-curve to get sorted keyframes for.
-
-    Returns:
-        list: Keyframe objects sorted by frame (co.x).
-    """
-    # Build a stable key for this f-curve
-    action_name = ""
-    if fcurve.id_data and hasattr(fcurve.id_data, 'name'):
-        action_name = fcurve.id_data.name
-    key = (action_name, fcurve.data_path, fcurve.array_index)
-
+    points = list(fcurve.keyframe_points)
+    frames = tuple(point.co.x for point in points)
+    key = fcurve.as_pointer()  # Distinguishes channels in different action slots.
     cached = _sorted_kf_cache.get(key)
-    if cached is not None and len(cached) == len(fcurve.keyframe_points):
-        return cached
-
-    # Rebuild cache for this f-curve
-    sorted_kfs = sorted(fcurve.keyframe_points, key=lambda kp: kp.co.x)
-    _sorted_kf_cache[key] = sorted_kfs
-    return sorted_kfs
+    if cached is None or cached[0] != frames:
+        order = tuple(sorted(range(len(frames)), key=frames.__getitem__))
+        if len(_sorted_kf_cache) >= 512:
+            _sorted_kf_cache.clear()
+        _sorted_kf_cache[key] = (frames, order)
+    else:
+        order = cached[1]
+    return [points[index] for index in order]
 
 
 def invalidate_keyframe_cache() -> None:
@@ -588,6 +574,7 @@ def _evict_frame_cache_if_needed() -> None:
             del _frame_cache[key]
 
 
+@sampling_operation
 def get_world_position_at_frame(
     obj: bpy.types.Object,
     bone_name: str,
@@ -612,9 +599,9 @@ def get_world_position_at_frame(
     scene = bpy.context.scene
 
     # Build a cache key
-    int_frame = int(frame)
+    int_frame = math.floor(frame)
     subframe = frame - int_frame
-    cache_key = (obj.name, bone_name, round(frame, 4))
+    cache_key = (scene.as_pointer(), obj.as_pointer(), bone_name, frame)
 
     if int_frame in _frame_cache and cache_key in _frame_cache[int_frame]:
         return _frame_cache[int_frame][cache_key].copy()
@@ -680,6 +667,10 @@ def snapshot_fcurve(fcurve: bpy.types.FCurve) -> list[dict]:
     for keypoint in fcurve.keyframe_points:
         snapshot.append({
             "co": (keypoint.co.x, keypoint.co.y),
+            "type": keypoint.type,
+            "amplitude": keypoint.amplitude,
+            "back": keypoint.back,
+            "period": keypoint.period,
             "handle_left": (keypoint.handle_left[0], keypoint.handle_left[1]),
             "handle_right": (keypoint.handle_right[0], keypoint.handle_right[1]),
             "handle_left_type": keypoint.handle_left_type,
@@ -690,12 +681,38 @@ def snapshot_fcurve(fcurve: bpy.types.FCurve) -> list[dict]:
     return snapshot
 
 
+def validate_curve_snapshot(snapshot):
+    """Validate serialized keyframes completely before touching an f-curve."""
+    if not isinstance(snapshot, list):
+        raise ValueError("Curve keys must be a list")
+    frames = set()
+    for entry in snapshot:
+        if not isinstance(entry, dict):
+            raise ValueError("Keyframe must be an object")
+        for field in ('co', 'handle_left', 'handle_right'):
+            pair = entry.get(field)
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2 or any(
+                    isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in pair):
+                raise ValueError("Invalid keyframe coordinates")
+        if entry['co'][0] in frames:
+            raise ValueError("Duplicate keyframe times")
+        frames.add(entry['co'][0])
+        for field in ('handle_left_type', 'handle_right_type', 'interpolation', 'easing', 'type'):
+            value = entry.get(field)
+            if value is None and field in ('easing', 'type'):
+                continue
+            if value not in bpy.types.Keyframe.bl_rna.properties[field].enum_items.keys():
+                raise ValueError(f"Invalid keyframe {field}")
+        for field in ('amplitude', 'back', 'period'):
+            if field in entry and (not isinstance(entry[field], (int, float)) or not math.isfinite(entry[field])):
+                raise ValueError(f"Invalid keyframe {field}")
+
+
 def restore_fcurve(fcurve: bpy.types.FCurve, snapshot: list[dict]) -> bool:
     """Restore an f-curve to a previously captured snapshot state.
 
-    Matches keyframes using nearest-frame tolerance-based matching rather than
-    exact frame lookup. This handles cases where frames may differ slightly due
-    to floating-point precision or temporary keyframe insertion.
+    Validates and reconstructs keyframes, including original times, handles,
+    interpolation, and easing. Keys added since capture are removed.
 
     Args:
         fcurve: The f-curve to restore.
@@ -704,46 +721,33 @@ def restore_fcurve(fcurve: bpy.types.FCurve, snapshot: list[dict]) -> bool:
     Returns:
         bool: True if restoration succeeded, False otherwise.
     """
-    if fcurve is None or not snapshot:
+    if fcurve is None or not isinstance(snapshot, list):
         return False
-
     try:
-        # Build sorted list of snapshot entries for nearest-match lookup
-        snapshot_entries = sorted(snapshot, key=lambda kp: kp['co'][0])
-
-        restored = 0
-        for keypoint in fcurve.keyframe_points:
-            frame = keypoint.co.x
-            # Find nearest snapshot entry
-            best_match = None
-            best_dist = FRAME_MATCH_EPSILON + 1
-            for entry in snapshot_entries:
-                dist = abs(frame - entry['co'][0])
-                if dist < best_dist:
-                    best_dist = dist
-                    best_match = entry
-
-            if best_match is not None and best_dist <= FRAME_MATCH_EPSILON:
-                # Restore from this entry
-                keypoint.co.y = best_match['co'][1]
-                keypoint.handle_left[0] = best_match['handle_left'][0]
-                keypoint.handle_left[1] = best_match['handle_left'][1]
-                keypoint.handle_right[0] = best_match['handle_right'][0]
-                keypoint.handle_right[1] = best_match['handle_right'][1]
-                keypoint.handle_left_type = best_match['handle_left_type']
-                keypoint.handle_right_type = best_match['handle_right_type']
-                keypoint.interpolation = best_match['interpolation']
-                if hasattr(keypoint, 'easing'):
-                    keypoint.easing = best_match.get('easing', 'AUTO')
-                restored += 1
-
-        if restored < len(snapshot):
-            warn(f"Restored {restored} of {len(snapshot)} keyframes (some may have been removed or frames shifted)")
-
+        validate_curve_snapshot(snapshot)
+        entries = sorted(snapshot, key=lambda entry: entry['co'][0])
+        fcurve.keyframe_points.clear()
+        fcurve.keyframe_points.add(len(entries))
+        for point, entry in zip(fcurve.keyframe_points, entries):
+            point.co = entry['co']
+            point.handle_left_type = entry['handle_left_type']
+            point.handle_right_type = entry['handle_right_type']
+            point.interpolation = entry['interpolation']
+            point.easing = entry.get('easing', 'AUTO')
+            for field in ('amplitude', 'back', 'period', 'type'):
+                if field in entry:
+                    setattr(point, field, entry[field])
+            point.handle_left = entry['handle_left']
+            point.handle_right = entry['handle_right']
         fcurve.update()
+        # Keep explicitly captured handles, including manually adjusted AUTO ones.
+        for point, entry in zip(fcurve.keyframe_points, entries):
+            point.handle_left = entry['handle_left']
+            point.handle_right = entry['handle_right']
+        invalidate_keyframe_cache()
+        clear_frame_cache()
         return True
-
-    except Exception as exc:
+    except (KeyError, TypeError, ValueError, RuntimeError, ReferenceError) as exc:
         warn(f"Error restoring fcurve snapshot: {exc}")
         return False
 
@@ -781,13 +785,15 @@ def resolve_fcurve(
     if len(parts) == 2:
         prop_name = parts[0]
         axis = parts[1].lower()
+        if prop_name == "rotation_quaternion":
+            axis_map = {"w": 0, "x": 1, "y": 2, "z": 3}
         array_index = axis_map.get(axis, 0)
     else:
         prop_name = channel
         array_index = 0
 
     if bone_name:
-        data_path = f'pose.bones["{bone_name}"].{prop_name}'
+        data_path = f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].{prop_name}'
     else:
         data_path = prop_name
 

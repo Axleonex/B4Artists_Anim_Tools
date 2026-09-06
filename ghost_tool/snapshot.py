@@ -12,6 +12,8 @@ For cross-session persistence, use the export/import system.
 from __future__ import annotations
 
 import time
+import math
+import copy
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -19,7 +21,7 @@ from typing import Optional
 import bpy
 from mathutils import Vector
 
-from .ghost_data import GhostStore
+from .ghost_data import GhostStore, Ghost
 from .utils import log, warn, debug, get_scene_id, tag_viewport_redraw
 
 
@@ -56,6 +58,7 @@ class GhostSnapshot:
     object_names: set[str] = field(default_factory=set)
     bone_names: set[str] = field(default_factory=set)
     is_visible: bool = True
+    curve_data: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Serialize the snapshot for JSON export.
@@ -71,6 +74,7 @@ class GhostSnapshot:
             "object_names": list(self.object_names),
             "bone_names": list(self.bone_names),
             "is_visible": self.is_visible,
+            "curve_data": copy.deepcopy(self.curve_data),
         }
 
     @classmethod
@@ -83,11 +87,33 @@ class GhostSnapshot:
         Returns:
             GhostSnapshot: Reconstructed snapshot.
         """
+        if not isinstance(data, dict):
+            raise ValueError("Snapshot must be an object")
+        for name in ('name', 'uid'):
+            if name in data and (not isinstance(data[name], str) or not data[name]):
+                raise ValueError(f"Invalid snapshot {name}")
+        for name in ('ghost_data', 'curve_data', 'object_names', 'bone_names'):
+            if name in data and not isinstance(data[name], list):
+                raise ValueError(f"Snapshot {name} must be a list")
+        for name in ('object_names', 'bone_names'):
+            if any(not isinstance(value, str) for value in data.get(name, [])):
+                raise ValueError(f"Invalid snapshot {name}")
+        if not isinstance(data.get('timestamp', 0), (int, float)) or not math.isfinite(data.get('timestamp', 0)):
+            raise ValueError("Invalid snapshot timestamp")
+        if type(data.get('is_visible', True)) is not bool:
+            raise ValueError("Invalid snapshot visibility")
+        ghosts = [Ghost.from_dict(value).to_dict() for value in data.get('ghost_data', [])]
+        for curve in data.get('curve_data', []):
+            if not isinstance(curve, dict) or any(not isinstance(curve.get(k), str) for k in ('object_name', 'bone_name', 'channel')):
+                raise ValueError("Invalid snapshot curve reference")
+            from .fcurve_utils import validate_curve_snapshot
+            validate_curve_snapshot(curve.get('keys'))
         return cls(
             name=data.get("name", "Unnamed"),
             uid=data.get("uid", uuid.uuid4().hex[:8]),
             timestamp=data.get("timestamp", time.time()),
-            ghost_data=data.get("ghost_data", []),
+            ghost_data=ghosts,
+            curve_data=copy.deepcopy(data.get("curve_data", [])),
             object_names=set(data.get("object_names", [])),
             bone_names=set(data.get("bone_names", [])),
             is_visible=data.get("is_visible", True),
@@ -167,9 +193,24 @@ class SnapshotStore:
             if bone_name:
                 bone_names.add(bone_name)
 
+        from . import fcurve_utils
+        curves = []
+        seen = set()
+        for ghost in ghost_store:
+            key = (ghost.object_name, ghost.bone_name, ghost.channel)
+            if key in seen:
+                continue
+            seen.add(key)
+            obj = scene.objects.get(ghost.object_name)
+            curve = fcurve_utils.resolve_fcurve(obj, ghost.bone_name, ghost.channel)
+            if curve is not None:
+                curves.append(dict(object_name=ghost.object_name, bone_name=ghost.bone_name,
+                                   channel=ghost.channel, keys=fcurve_utils.snapshot_fcurve(curve)))
+
         snapshot = GhostSnapshot(
             name=name,
             ghost_data=ghost_data,
+            curve_data=curves,
             object_names=object_names,
             bone_names=bone_names,
         )
@@ -207,6 +248,34 @@ class SnapshotStore:
             warn(f"Snapshot '{snapshot_uid}' not found")
             return False
 
+        if snapshot.curve_data:
+            targets = []
+            for entry in snapshot.curve_data:
+                obj = scene.objects.get(entry['object_name'])
+                curve = fcurve_utils.resolve_fcurve(obj, entry['bone_name'], entry['channel'])
+                if curve is None:
+                    warn("Snapshot restore aborted: an original curve is missing")
+                    return False
+                targets.append((curve, entry['keys'], fcurve_utils.snapshot_fcurve(curve)))
+            try:
+                for curve, keys, _backup in targets:
+                    if not fcurve_utils.restore_fcurve(curve, keys):
+                        raise ValueError("Snapshot curve restore failed")
+            except Exception as exc:
+                for curve, _keys, backup in targets:
+                    fcurve_utils.restore_fcurve(curve, backup)
+                warn(str(exc))
+                return False
+            from .ghost_pipeline import GhostPipeline
+            GhostPipeline.get(scene).mark_dirty()
+            if scene == bpy.context.scene:
+                from .api import refresh_ghosts
+                refresh_ghosts()
+            tag_viewport_redraw(bpy.context)
+            return True
+
+        # Legacy snapshots contain ghost samples only, so use their original
+        # approximate handle-restoration behavior for backward compatibility.
         restored_count = 0
         skipped = 0
         for gd in snapshot.ghost_data:
@@ -312,15 +381,11 @@ class SnapshotStore:
         Args:
             data: List of snapshot dictionaries.
         """
-        self._snapshots.clear()
-        self._index.clear()
-        for item in data:
-            try:
-                snap = GhostSnapshot.from_dict(item)
-                self._snapshots.append(snap)
-                self._index[snap.uid] = snap
-            except Exception as exc:
-                warn(f"Skipping invalid snapshot data: {exc}")
+        snapshots = [GhostSnapshot.from_dict(item) for item in data]
+        if len({snapshot.uid for snapshot in snapshots}) != len(snapshots):
+            raise ValueError("Duplicate snapshot IDs")
+        self._snapshots = snapshots[-MAX_SNAPSHOTS:]
+        self._index = {snapshot.uid: snapshot for snapshot in self._snapshots}
 
 
 # ---------------------------------------------------------------------------

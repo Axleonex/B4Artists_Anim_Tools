@@ -11,6 +11,7 @@ addon version) to a JSON file.  This enables:
 from __future__ import annotations
 
 import json
+import tempfile
 import os
 from typing import Optional
 
@@ -25,10 +26,10 @@ from .utils import log, warn, debug, tag_viewport_redraw
 # Constants
 # ---------------------------------------------------------------------------
 
-EXPORT_VERSION: str = "1.0.0"
+EXPORT_VERSION: str = "1.1.0"
 """File format version for compatibility checking."""
 
-COMPATIBLE_VERSIONS: set[str] = {"1.0.0"}
+COMPATIBLE_VERSIONS: set[str] = {"1.0.0", "1.1.0"}
 """Set of file format versions that this module can read."""
 
 _REQUIRED_GHOST_FIELDS = {"frame", "world_position", "local_value", "channel", "object_name"}
@@ -89,14 +90,22 @@ def export_ghosts(filepath: str, scene: bpy.types.Scene) -> bool:
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
-        # Write as human-readable JSON with UTF-8 encoding
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, indent=2, ensure_ascii=False)
+        payload = json.dumps(export_data, indent=2, ensure_ascii=False, allow_nan=False)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                    dir=output_dir or '.', prefix='.ghost-export-', suffix='.tmp', delete=False) as output:
+                temp_path = output.name
+                output.write(payload)
+            os.replace(temp_path, filepath)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
         log(f"Exported {len(ghost_store)} ghosts to '{filepath}'")
         return True
 
-    except (IOError, OSError) as exc:
+    except (IOError, OSError, ValueError, TypeError) as exc:
         warn(f"Error exporting ghosts: {exc}")
         return False
 
@@ -144,44 +153,50 @@ def import_ghosts(
         warn(f"Error reading file '{filepath}': {exc}")
         return False
 
-    # Validate file format version for compatibility
-    file_version = data.get("version", "unknown")
-    if file_version not in COMPATIBLE_VERSIONS:
-        warn(f"File version '{file_version}' may not be compatible (supported: {COMPATIBLE_VERSIONS}). Attempting import anyway.")
+    # Parse and validate BOTH stores before replacing either one.
+    from .ghost_data import Ghost
+    try:
+        if not isinstance(data, dict):
+            raise ValueError("Import root must be an object")
+        if not any(key in data for key in ('ghosts', 'snapshots')):
+            raise ValueError("File contains no ghost or snapshot data")
+        ghost_data_list = data.get('ghosts', [])
+        snapshot_data_list = data.get('snapshots', [])
+        if not isinstance(ghost_data_list, list) or not isinstance(snapshot_data_list, list):
+            raise ValueError("Ghosts and snapshots must be lists")
+        staged_ghosts = []
+        for item in ghost_data_list:
+            valid, error = _validate_ghost_data(item)
+            if not valid:
+                raise ValueError(error)
+            staged_ghosts.append(Ghost.from_dict(item).to_dict())
+        if len({item['uid'] for item in staged_ghosts}) != len(staged_ghosts):
+            raise ValueError("Duplicate ghost IDs")
+        staged_snapshots = SnapshotStore()
+        staged_snapshots.load_from_dict_list(snapshot_data_list)
+        if target_object:
+            staged_ghosts = _remap_ghost_data(staged_ghosts, target_object, remap_bones)
+            for snapshot in staged_snapshots.get_all():
+                snapshot.ghost_data = _remap_ghost_data(snapshot.ghost_data, target_object, remap_bones)
+                for curve in snapshot.curve_data:
+                    curve['object_name'] = target_object.name
+                snapshot.object_names = {target_object.name}
+                snapshot.bone_names = {g['bone_name'] for g in snapshot.ghost_data if g['bone_name']}
+        ghosts = [Ghost.from_dict(item) for item in staged_ghosts]
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        warn(f"Import rejected; existing data preserved: {exc}")
+        return False
 
-    # Load ghost data
-    ghost_data_list = data.get("ghosts", [])
-    snapshot_data_list = data.get("snapshots", [])
-
-    # Remap object and bone names if a target is provided
-    if target_object:
-        ghost_data_list = _remap_ghost_data(
-            ghost_data_list, target_object, remap_bones
-        )
-
-    # Validate and filter ghost data before loading
-    valid_ghosts = []
-    error_count = 0
-    for gd in ghost_data_list:
-        ok, err = _validate_ghost_data(gd)
-        if ok:
-            valid_ghosts.append(gd)
-        else:
-            error_count += 1
-            warn(f"Skipping invalid ghost entry: {err}")
-    if error_count > 0:
-        warn(f"Skipped {error_count} invalid ghost entries during import")
-
-    # Load into stores
     ghost_store = GhostStore.get(scene)
-    ghost_store.load_from_dict_list(valid_ghosts)
-
     snapshot_store = SnapshotStore.get(scene)
-    snapshot_store.load_from_dict_list(snapshot_data_list)
-
-    ghost_count = len(ghost_store)
-    snap_count = len(snapshot_store.get_all())
-    log(f"Imported {ghost_count} ghosts and {snap_count} snapshots from '{filepath}'")
+    ghost_store.replace_all(ghosts)
+    snapshot_store._snapshots = staged_snapshots._snapshots
+    snapshot_store._index = staged_snapshots._index
+    from .session_state import SessionState
+    from .viewport_draw import _batch_cache
+    SessionState.get(scene).clear_all()
+    _batch_cache.clear()
+    log(f"Imported {len(ghost_store)} ghosts and {len(snapshot_store.get_all())} snapshots from '{filepath}'")
     return True
 
 

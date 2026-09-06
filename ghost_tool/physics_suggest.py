@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import math
 import bpy
 from mathutils import Vector
 
@@ -176,6 +177,9 @@ def compute_parabolic_suggestion(
             - "suggested_position" (Vector): New world position
             - "delta" (float): The applied correction amount
     """
+    if frame_rate <= 0 or not math.isfinite(frame_rate):
+        return []
+
     # Get the chain this ghost belongs to
     chain = store.get_chain(ghost.object_name, ghost.bone_name, ghost.channel)
 
@@ -311,35 +315,40 @@ def apply_suggestions(
         int: Number of ghosts updated.
     """
     applied = 0
-    skipped = 0
-
+    seen = set()
     for suggestion in suggestions:
-        uid = suggestion["uid"]
-        ghost = store.get_by_uid(uid)
-        if ghost is None:
-            skipped += 1
+        uid = suggestion['uid']
+        if uid in seen:
             continue
-
-        new_value = suggestion["suggested_value"]
-        ghost.local_value = new_value
-        ghost.world_position = suggestion["suggested_position"]
-
-        # Update the f-curve to reflect the new value
-        obj = bpy.data.objects.get(ghost.object_name)
-        if obj:
-            fcurve = fcurve_utils.resolve_fcurve(obj, ghost.bone_name, ghost.channel)
-            if fcurve:
-                # Use the scene's configured handle adjustment mode
-                # Default to "free" if not set
-                curve_mode = "free"
-                if hasattr(scene, 'ghost_tool'):
-                    curve_mode = scene.ghost_tool.curve_mode.lower()
-                fcurve_utils.recalculate_handles(fcurve, ghost.frame, new_value, mode=curve_mode)
-                applied += 1
-
-    if skipped > 0:
-        warn(f"Physics suggest: {skipped} ghost(s) not found (stale UIDs after regeneration)")
-
+        seen.add(uid)
+        ghost = store.get_by_uid(uid)
+        if ghost is None or ghost.is_pinned:
+            continue
+        obj = scene.objects.get(ghost.object_name)
+        if obj is None or _has_active_nla_strips(obj):
+            continue
+        curve = fcurve_utils.resolve_fcurve(obj, ghost.bone_name, ghost.channel)
+        if curve is None:
+            continue
+        backup = fcurve_utils.snapshot_fcurve(curve)
+        mode = scene.ghost_tool.curve_mode.lower()
+        try:
+            success = fcurve_utils.recalculate_handles(curve, ghost.frame, suggestion['suggested_value'], mode=mode)
+        except Exception as exc:
+            warn(f"Physics curve update failed: {exc}")
+            success = False
+        if not success:
+            fcurve_utils.restore_fcurve(curve, backup)
+            continue
+        ghost.local_value = suggestion['suggested_value']
+        ghost.world_position = suggestion['suggested_position'].copy()
+        applied += 1
+    if applied:
+        from .ghost_pipeline import GhostPipeline
+        GhostPipeline.get(scene).mark_dirty()
+        if scene == bpy.context.scene:
+            from .api import refresh_ghosts
+            refresh_ghosts()
     return applied
 
 
@@ -362,7 +371,12 @@ def _has_active_nla_strips(obj: bpy.types.Object) -> bool:
     """
     if not obj or not obj.animation_data:
         return False
-    return bool(obj.animation_data.use_nla and obj.animation_data.nla_tracks)
+    animation = obj.animation_data
+    if not animation.use_nla:
+        return False
+    tracks = [track for track in animation.nla_tracks if not track.mute]
+    solo = [track for track in tracks if track.is_solo]
+    return any(not strip.mute for track in (solo or tracks) for strip in track.strips)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +392,7 @@ def _has_active_nla_strips(obj: bpy.types.Object) -> bool:
 # ---------------------------------------------------------------------------
 
 _physics_preview_data: list[dict] = []
+_physics_preview_scene = None
 
 
 def _set_physics_preview(suggestions: list[dict]) -> None:
@@ -390,7 +405,9 @@ def _set_physics_preview(suggestions: list[dict]) -> None:
         suggestions: List of dicts, each containing at minimum
             ``"suggested_position"`` (Vector) keyed for the draw handler.
     """
-    global _physics_preview_data
+    global _physics_preview_data, _physics_preview_scene
+    from .utils import get_scene_id
+    _physics_preview_scene = get_scene_id(bpy.context.scene)
     _physics_preview_data = list(suggestions)
 
 
@@ -399,7 +416,8 @@ def _clear_physics_preview() -> None:
 
     Call this before activating a new preview source (mutual exclusion).
     """
-    global _physics_preview_data
+    global _physics_preview_data, _physics_preview_scene
+    _physics_preview_scene = None
     _physics_preview_data = []
 
 
@@ -412,6 +430,9 @@ def get_physics_preview() -> list[dict]:
     Returns:
         list[dict]: Current preview entries, or [].
     """
+    from .utils import get_scene_id
+    if bpy.context.scene is None or get_scene_id(bpy.context.scene) != _physics_preview_scene:
+        return []
     return _physics_preview_data
 
 
@@ -478,7 +499,7 @@ class GHOST_OT_physics_suggest(bpy.types.Operator):
         self._preview_active = False
 
         store = GhostStore.get(context.scene)
-        selected = store.get_selected()
+        selected = store.get_selected(context.scene)
         if not selected:
             selected = store.all_ghosts
         if not selected:
@@ -486,9 +507,14 @@ class GHOST_OT_physics_suggest(bpy.types.Operator):
             return {'CANCELLED'}
 
         # Compute all suggestions for preview
-        frame_rate = context.scene.render.fps
+        frame_rate = context.scene.render.fps / context.scene.render.fps_base
         all_suggestions = []
+        visited_segments = set()
         for ghost in selected:
+            segment = (ghost.object_name, ghost.bone_name, ghost.channel, ghost.parent_frame_a, ghost.parent_frame_b)
+            if segment in visited_segments:
+                continue
+            visited_segments.add(segment)
             suggestions = compute_parabolic_suggestion(
                 ghost, store,
                 gravity_strength=self.gravity_strength,
@@ -509,6 +535,9 @@ class GHOST_OT_physics_suggest(bpy.types.Operator):
         _set_physics_preview(all_suggestions)
 
         context.window_manager.modal_handler_add(self)
+        from .session_state import SessionState
+        self._preview_session = SessionState.get(context.scene)
+        self._preview_session.drag_active = True
         self.report({'INFO'}, f"Physics preview: {len(all_suggestions)} ghosts. ENTER/LMB to apply, ESC/RMB to cancel.")
         tag_viewport_redraw(context)
         return {'RUNNING_MODAL'}
@@ -541,6 +570,8 @@ class GHOST_OT_physics_suggest(bpy.types.Operator):
         applied = apply_suggestions(self._preview_suggestions, store, context.scene)
         _clear_physics_preview()
         self._preview_active = False
+        if getattr(self, "_preview_session", None):
+            self._preview_session.drag_active = False
         self.report({'INFO'}, f"Applied physics suggestions to {applied} ghosts")
         tag_viewport_redraw(context)
         return {'FINISHED'}
@@ -549,6 +580,8 @@ class GHOST_OT_physics_suggest(bpy.types.Operator):
         """Discard the preview without applying."""
         _clear_physics_preview()
         self._preview_active = False
+        if getattr(self, "_preview_session", None):
+            self._preview_session.drag_active = False
         self.report({'INFO'}, "Physics suggestion cancelled")
         tag_viewport_redraw(context)
         return {'CANCELLED'}
@@ -647,23 +680,20 @@ class GHOST_OT_archetype_bake(bpy.types.Operator):
         # Push a single undo step before any writes — unconditional.
         bpy.ops.ed.undo_push(message=f"Archetype Bake: {archetype_name}")
 
-        # Replace is the only supported collision policy; do it explicitly.
-        self._clear_channel_keys(fcurve, start, end)
-
-        # Stamp one keyframe per frame across the bake range.
+        backup = fcurve_utils.snapshot_fcurve(fcurve)
         total_frames = end - start
         stamped = 0
-        for frame in range(start, end + 1):
-            t = (frame - start) / total_frames
-            displacement = archetype_fn(t) * amplitude
-            success = fcurve_utils.insert_keyframe_from_ghost(
-                fcurve,
-                float(frame),
-                displacement,
-                handle_type="AUTO_CLAMPED",
-            )
-            if success:
+        try:
+            self._clear_channel_keys(fcurve, start, end)
+            for frame in range(start, end + 1):
+                displacement = archetype_fn((frame - start) / total_frames) * amplitude
+                point = fcurve.keyframe_points.insert(float(frame), displacement, options={'FAST'})
+                point.handle_left_type = point.handle_right_type = 'AUTO_CLAMPED'
                 stamped += 1
+        except Exception as exc:
+            fcurve_utils.restore_fcurve(fcurve, backup)
+            self.report({'ERROR'}, f"Archetype bake cancelled; original curve restored: {exc}")
+            return {'CANCELLED'}
 
         fcurve.update()
         fcurve_utils.invalidate_keyframe_cache()
@@ -693,17 +723,12 @@ class GHOST_OT_archetype_bake(bpy.types.Operator):
             start: Inclusive start frame.
             end: Inclusive end frame.
         """
-        to_remove = [
-            kp for kp in fcurve.keyframe_points
-            if start <= kp.co.x <= end
-        ]
-        for kp in reversed(to_remove):
-            try:
-                fcurve.keyframe_points.remove(kp)
-            except RuntimeError as exc:
-                warn(f"Could not remove keyframe at f{kp.co.x:.1f}: {exc}")
-        if to_remove:
-            fcurve.update()
+        # Reacquire each key after removal; RNA references can be invalidated.
+        for index in range(len(fcurve.keyframe_points) - 1, -1, -1):
+            point = fcurve.keyframe_points[index]
+            if start <= point.co.x <= end:
+                fcurve.keyframe_points.remove(point, fast=True)
+        fcurve.update()
 
     @staticmethod
     def _maybe_regenerate_ghosts(
